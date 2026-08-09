@@ -120,11 +120,16 @@ def main():
             "encoder",
             ppo_runner.alg.encoder.num_input_dim,
         )
-    # reset environment
-    obs, obs_dict = env.get_observations()
-    obs_history = obs_dict["observations"].get("obsHistory")
-    obs_history = obs_history.flatten(start_dim=1)
-    commands = obs_dict["observations"].get("commands") 
+    # reset environment (supports Isaac Lab <=2.2 tuple and >=2.3 TensorDict APIs)
+    observation_result = env.get_observations()
+    if isinstance(observation_result, tuple):
+        obs, obs_dict = observation_result
+        observation_groups = obs_dict["observations"]
+    else:
+        observation_groups = observation_result
+        obs = observation_groups["policy"]
+    obs_history = observation_groups["obsHistory"].flatten(start_dim=1)
+    commands = observation_groups["commands"]
     # simulate environment
     while simulation_app.is_running():
         # run everything in inference mode
@@ -133,10 +138,15 @@ def main():
             est = encoder(obs_history)
             actions = policy(torch.cat((est, obs, commands), dim=-1).detach())
             # env stepping
-            obs, _, _, infos = env.step(actions)
-            obs_history = infos["observations"].get("obsHistory")
-            obs_history = obs_history.flatten(start_dim=1)
-            commands = infos["observations"].get("commands") 
+            step_observations, _, _, infos = env.step(actions)
+            if hasattr(step_observations, "keys") and "policy" in step_observations.keys():
+                observation_groups = step_observations
+                obs = observation_groups["policy"]
+            else:
+                obs = step_observations
+                observation_groups = infos["observations"]
+            obs_history = observation_groups["obsHistory"].flatten(start_dim=1)
+            commands = observation_groups["commands"]
 
     # close the simulator
     env.close()

@@ -67,11 +67,15 @@ class WFSceneCfg(InteractiveSceneCfg):
 
     # height sensors
     height_scanner: RayCasterCfg = MISSING
+    wheel_L_ground_scan: RayCasterCfg | None = None
+    wheel_R_ground_scan: RayCasterCfg | None = None
 
     # contact sensors
     contact_forces = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=4, track_air_time=True, update_period=0.0
     )
+    wheel_L_ground_contact: ContactSensorCfg | None = None
+    wheel_R_ground_contact: ContactSensorCfg | None = None
 
 
 ##############

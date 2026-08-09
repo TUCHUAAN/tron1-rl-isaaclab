@@ -160,3 +160,105 @@ STAIRS_TERRAINS_PLAY_CFG = TerrainGeneratorCfg(
     curriculum=True,
     difficulty_range=(1.0, 1.0),
 )
+
+
+########################################
+# Wheelfoot dual-expert terrain curricula
+########################################
+
+WHEEL_MODE_TERRAINS_CFG = TerrainGeneratorCfg(
+    seed=42,
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=16,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=True,
+    sub_terrains={
+        "flat": MeshPlaneTerrainCfg(proportion=0.15),
+        "slope_up": HfPyramidSlopedTerrainCfg(
+            proportion=0.20, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+        ),
+        "slope_down": HfInvertedPyramidSlopedTerrainCfg(
+            proportion=0.20, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+        ),
+        "waves": HfWaveTerrainCfg(
+            proportion=0.175, amplitude_range=(0.01, 0.06), num_waves=10, border_width=0.25
+        ),
+        "random_rough": HfRandomUniformTerrainCfg(
+            proportion=0.175, noise_range=(0.01, 0.06), noise_step=0.01, border_width=0.25
+        ),
+        "stairs_down": MeshInvertedPyramidStairsTerrainCfg(
+            proportion=0.10,
+            step_height_range=(0.03, 0.12),
+            step_width=0.35,
+            platform_width=3.0,
+            border_width=1.0,
+            holes=False,
+        ),
+    },
+    curriculum=True,
+    difficulty_range=(0.0, 1.0),
+)
+
+WHEEL_MODE_TERRAINS_PLAY_CFG = WHEEL_MODE_TERRAINS_CFG.replace(
+    num_rows=4,
+    num_cols=4,
+    curriculum=False,
+    difficulty_range=(0.6, 0.6),
+)
+
+
+FOOT_ALL_TERRAINS_CFG = TerrainGeneratorCfg(
+    seed=42,
+    size=(12.0, 12.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=16,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=True,
+    sub_terrains={
+        "flat": MeshPlaneTerrainCfg(proportion=0.10),
+        "waves": HfWaveTerrainCfg(
+            proportion=0.10, amplitude_range=(0.01, 0.08), num_waves=10, border_width=0.25
+        ),
+        "random_rough": HfRandomUniformTerrainCfg(
+            proportion=0.15, noise_range=(0.01, 0.08), noise_step=0.01, border_width=0.25
+        ),
+        "stairs_up": MeshPyramidStairsTerrainCfg(
+            proportion=0.25,
+            step_height_range=(0.05, 0.20),
+            step_width=0.3,
+            platform_width=3.0,
+            border_width=1.0,
+            holes=False,
+        ),
+        "stairs_down": MeshInvertedPyramidStairsTerrainCfg(
+            proportion=0.25,
+            step_height_range=(0.05, 0.20),
+            step_width=0.3,
+            platform_width=3.0,
+            border_width=1.0,
+            holes=False,
+        ),
+        "slope_up": HfPyramidSlopedTerrainCfg(
+            proportion=0.075, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+        ),
+        "slope_down": HfInvertedPyramidSlopedTerrainCfg(
+            proportion=0.075, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+        ),
+    },
+    curriculum=True,
+    difficulty_range=(0.0, 1.0),
+)
+
+FOOT_ALL_TERRAINS_PLAY_CFG = FOOT_ALL_TERRAINS_CFG.replace(
+    num_rows=4,
+    num_cols=4,
+    curriculum=False,
+    difficulty_range=(0.6, 0.6),
+)

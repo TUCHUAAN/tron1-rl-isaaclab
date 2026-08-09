@@ -34,9 +34,14 @@ def apply_external_force_torque_stochastic(
     """
     # extract the used quantities (to enable type-hinting)
     asset: RigidObject | Articulation = env.scene[asset_cfg.name]
-    # clear the existing forces and torques
-    asset._external_force_b *= 0
-    asset._external_torque_b *= 0
+    # resolve the selected bodies and clear previous forces through the public API
+    num_bodies = len(asset_cfg.body_ids) if isinstance(asset_cfg.body_ids, list) else asset.num_bodies
+    zero_wrench = torch.zeros((env.scene.num_envs, num_bodies, 3), device=asset.device)
+    asset.set_external_force_and_torque(
+        zero_wrench,
+        zero_wrench,
+        body_ids=asset_cfg.body_ids,
+    )
 
     # resolve environment ids
     if env_ids is None:
@@ -48,9 +53,6 @@ def apply_external_force_torque_stochastic(
 
     if len(masked_env_ids) == 0:
         return
-
-    # resolve number of bodies
-    num_bodies = len(asset_cfg.body_ids) if isinstance(asset_cfg.body_ids, list) else asset.num_bodies
 
     # sample random forces and torques
     size = (len(masked_env_ids), num_bodies, 3)

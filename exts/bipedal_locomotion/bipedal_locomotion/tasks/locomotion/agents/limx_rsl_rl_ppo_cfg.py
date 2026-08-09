@@ -151,3 +151,21 @@ class WF_TRON1AFlatPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         activation = "elu",
         orthogonal_init = False,
     )
+
+
+@configclass
+class WF_TRON1AWheelModePPORunnerCfg(WF_TRON1AFlatPPORunnerCfg):
+    """PPO runner for the rolling/contact-constrained wheel expert."""
+
+    max_iterations = 10000
+    save_interval = 500
+    experiment_name = "wf_tron_1a_wheel_mode"
+
+
+@configclass
+class WF_TRON1AFootAllTerrainPPORunnerCfg(WF_TRON1AFlatPPORunnerCfg):
+    """PPO runner for the wheel-locked all-terrain foot expert."""
+
+    max_iterations = 15000
+    save_interval = 500
+    experiment_name = "wf_tron_1a_foot_all_terrain"

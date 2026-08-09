@@ -52,15 +52,16 @@ class OnPolicyRunner:
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
-        obs, extras = self.env.get_observations()   
+        obs, observation_groups = self._get_grouped_observations()
         self.num_obs = obs.shape[1]
         self.obs_history_len = self.alg_cfg.pop("obs_history_len")
-        assert "commands" in extras["observations"], f"Commands not found in observations"
-        self.num_commands = extras["observations"]["commands"].shape[1]
-        assert "critic" in extras["observations"], f"Critic observations not found in observations"
-        num_critic_obs = extras["observations"]["critic"].shape[1] + self.num_commands
+        assert "commands" in observation_groups, "Commands not found in observations"
+        self.num_commands = observation_groups["commands"].shape[1]
+        assert "critic" in observation_groups, "Critic observations not found in observations"
+        num_critic_obs = observation_groups["critic"].shape[1] + self.num_commands
         privileged_input_size = num_critic_obs
-        self.ecd_cfg["num_input_dim"] = self.obs_history_len * self.num_obs
+        self.obs_history_dim = observation_groups["obsHistory"].flatten(start_dim=1).shape[1]
+        self.ecd_cfg["num_input_dim"] = self.obs_history_dim
 
         encoder = eval("MLP_Encoder")(
             **self.ecd_cfg,
@@ -94,7 +95,7 @@ class OnPolicyRunner:
             self.num_steps_per_env,
             [self.num_obs],
             [num_critic_obs],
-            [self.obs_history_len * self.num_obs],
+            [self.obs_history_dim],
             [self.num_commands],
             [self.env.num_actions],
         )
@@ -115,6 +116,32 @@ class OnPolicyRunner:
 
         # _, _ = self.env.reset()
         _ = self.env.reset()
+
+    @staticmethod
+    def _is_grouped_observation(value):
+        """Return whether an observation object contains named policy/critic groups."""
+        return hasattr(value, "keys") and "policy" in value.keys()
+
+    def _get_grouped_observations(self):
+        """Normalize Isaac Lab <=2.2 tuple output and >=2.3 TensorDict output."""
+        result = self.env.get_observations()
+        if isinstance(result, tuple):
+            policy_obs, extras = result
+            groups = extras["observations"]
+            return policy_obs, groups
+        if self._is_grouped_observation(result):
+            return result["policy"], result
+        raise TypeError(f"Unsupported observation output type: {type(result)!r}")
+
+    def _unpack_step_observations(self, policy_or_groups, infos):
+        """Return policy observations and all named groups for either wrapper API."""
+        if self._is_grouped_observation(policy_or_groups):
+            groups = policy_or_groups
+            policy_obs = groups["policy"]
+            infos["observations"] = groups
+            return policy_obs, groups
+        groups = infos["observations"]
+        return policy_or_groups, groups
 
     def learn(self, num_learning_iterations, init_at_random_ep_len=False):
         # initialize writer
@@ -141,11 +168,10 @@ class OnPolicyRunner:
             self.env.episode_length_buf = torch.randint_like(
                 self.env.episode_length_buf, high=int(self.env.max_episode_length)
             )
-        obs, extras = self.env.get_observations()
-        obs_history = extras["observations"].get("obsHistory")
-        obs_history = obs_history.flatten(start_dim=1)
-        critic_obs = extras["observations"].get("critic")
-        commands = extras["observations"].get("commands") 
+        obs, observation_groups = self._get_grouped_observations()
+        obs_history = observation_groups["obsHistory"].flatten(start_dim=1)
+        critic_obs = observation_groups["critic"]
+        commands = observation_groups["commands"]
 
         obs, obs_history, commands, critic_obs = (
             obs.to(self.device),
@@ -174,11 +200,12 @@ class OnPolicyRunner:
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, obs_history, commands, critic_obs)
                     # add critic_obs_buf to step returns, make sure it updates in every for loop
-                    (obs, rewards, dones, infos) = self.env.step(actions)
+                    (step_observations, rewards, dones, infos) = self.env.step(actions)
+                    obs, observation_groups = self._unpack_step_observations(step_observations, infos)
 
-                    critic_obs = infos["observations"]["critic"]
-                    obs_history = infos["observations"]["obsHistory"].flatten(start_dim=1)
-                    commands = infos["observations"]["commands"]
+                    critic_obs = observation_groups["critic"]
+                    obs_history = observation_groups["obsHistory"].flatten(start_dim=1)
+                    commands = observation_groups["commands"]
 
                     # critic_obs = obs
                     obs, obs_history, commands, critic_obs, rewards, dones = (

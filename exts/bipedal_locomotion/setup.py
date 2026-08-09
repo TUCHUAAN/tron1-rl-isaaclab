@@ -4,7 +4,7 @@ import itertools
 import os
 import toml
 
-from setuptools import setup
+from setuptools import find_packages, setup
 
 # Obtain the extension data from the extension.toml file
 EXTENSION_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -50,7 +50,7 @@ EXTRAS_REQUIRE["all"] = list(set(EXTRAS_REQUIRE["all"]))
 # Installation operation
 setup(
     name="bipedal_locomotion",
-    packages=["bipedal_locomotion"],
+    packages=find_packages(),
     author=EXTENSION_TOML_DATA["package"]["author"],
     maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
     url=EXTENSION_TOML_DATA["package"]["repository"],

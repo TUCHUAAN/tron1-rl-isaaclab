@@ -1,0 +1,10 @@
+WARNING Sun Aug  9 21:33:24 2026: Attach conflict when attaching 'wheel_biped' to 'configured training terrain', policy is 'warning'
+timestep: parent has 0.002, child has 0.001, keeping parent value
+njmax: parent has -1, child has 500, keeping parent value
+nconmax: parent has -1, child has 100, keeping parent value
+
+WARNING Sun Aug  9 21:33:30 2026: Attach conflict when attaching 'wheel_biped' to 'configured training terrain', policy is 'warning'
+timestep: parent has 0.002, child has 0.001, keeping parent value
+njmax: parent has -1, child has 500, keeping parent value
+nconmax: parent has -1, child has 100, keeping parent value
+

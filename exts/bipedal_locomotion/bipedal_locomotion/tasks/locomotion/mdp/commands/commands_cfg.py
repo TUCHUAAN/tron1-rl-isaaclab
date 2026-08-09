@@ -4,6 +4,7 @@ from dataclasses import MISSING
 from isaaclab.managers import CommandTermCfg
 from isaaclab.utils import configclass
 
+from .body_height_command import BodyHeightCommand
 from .gait_command import GaitCommand  # Import the GaitCommand class
 
 
@@ -31,3 +32,20 @@ class UniformGaitCommandCfg(CommandTermCfg):
 
     resampling_time_range: tuple[float, float] = MISSING
     """Time interval for resampling the gait (in seconds)."""
+
+
+@configclass
+class UniformBodyHeightCommandCfg(CommandTermCfg):
+    """Configuration for a smooth body-height command relative to local terrain."""
+
+    class_type: type = BodyHeightCommand
+
+    @configclass
+    class Ranges:
+        height: tuple[float, float] = MISSING
+        """Commanded relative base-height range in metres."""
+
+    ranges: Ranges = MISSING
+    resampling_time_range: tuple[float, float] = (5.0, 8.0)
+    max_rate: float = 0.08
+    """Maximum command slew rate in metres per second."""

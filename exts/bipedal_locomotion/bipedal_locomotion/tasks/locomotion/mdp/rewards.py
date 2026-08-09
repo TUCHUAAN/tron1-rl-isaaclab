@@ -16,6 +16,18 @@ from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.sensors import ContactSensor, RayCaster
 import isaaclab.utils.math as math_utils
 
+from .reward_math import (
+    all_support_confidence,
+    base_height_plane_error_l2,
+    contact_confidence_from_force_history,
+    fit_height_plane,
+    horizontal_neutral_penalty,
+    landing_impact_l2,
+    rolling_contact_slip_l2,
+    terrain_orientation_penalty,
+    wheel_clearance_confidence,
+)
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
     from isaaclab.managers import RewardTermCfg
@@ -532,3 +544,395 @@ class ActionSmoothnessPenalty(ManagerTermBase):
 
         # Return the penalty scaled by the configured weight
         return penalty
+
+
+def body_height_command_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Track commanded base height relative to the local terrain using an L2 error."""
+    asset: RigidObject = env.scene[asset_cfg.name]
+    target_height = env.command_manager.get_command(command_name)[:, 0]
+    if sensor_cfg is None:
+        ground_height = torch.zeros_like(target_height)
+    else:
+        sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
+        ray_height = sensor.data.ray_hits_w[..., 2]
+        ray_height = torch.where(torch.isfinite(ray_height), ray_height, torch.nan)
+        ground_height = torch.nanmedian(ray_height, dim=1).values
+        ground_height = torch.nan_to_num(ground_height, nan=0.0, posinf=0.0, neginf=0.0)
+    actual_height = asset.data.root_pos_w[:, 2] - ground_height
+    return torch.square(actual_height - target_height)
+
+
+def _contact_force_history(sensor: ContactSensor, body_ids) -> torch.Tensor:
+    """Return contact-force history with a history dimension on all supported IsaacLab versions."""
+    history = sensor.data.net_forces_w_history
+    if history is None:
+        history = sensor.data.net_forces_w.unsqueeze(1)
+    return history[:, :, body_ids]
+
+
+def _wheel_contact_confidence(
+    sensor: ContactSensor,
+    body_ids,
+    force_off: float,
+    force_on: float,
+) -> torch.Tensor:
+    return contact_confidence_from_force_history(
+        _contact_force_history(sensor, body_ids),
+        force_off=force_off,
+        force_on=force_on,
+    )
+
+
+def _terrain_plane(sensor: RayCaster) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return fit_height_plane(sensor.data.ray_hits_w)
+
+
+def _filtered_contact_force_history(sensor: ContactSensor) -> torch.Tensor:
+    """Return ground-filtered contact-force history shaped ``(N, T, 1, 3)``."""
+    history = sensor.data.force_matrix_w_history
+    if history is None:
+        current = sensor.data.force_matrix_w
+        if current is None:
+            raise RuntimeError(
+                f"Contact sensor '{sensor.cfg.prim_path}' has no filtered force matrix. "
+                "Configure filter_prim_paths_expr for the terrain mesh."
+            )
+        history = current.unsqueeze(1)
+    if history.ndim != 5 or history.shape[-1] != 3:
+        raise RuntimeError(f"Unexpected filtered contact history shape: {tuple(history.shape)}")
+    return torch.sum(history, dim=3)
+
+
+def _wheel_ground_contact_confidence(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    contact_sensor_names: tuple[str, str],
+    terrain_sensor_names: tuple[str, str],
+    wheel_radius: float,
+    force_off: float,
+    force_on: float,
+    geometry_tolerance_on: float,
+    geometry_tolerance_off: float,
+) -> torch.Tensor:
+    """Combine filtered support force and wheel-local ground clearance for both wheels."""
+    if len(contact_sensor_names) != 2 or len(terrain_sensor_names) != 2:
+        raise ValueError("TRON1A wheel contact requires exactly two contact sensors and two terrain sensors.")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_positions_w = asset.data.body_link_pos_w[:, asset_cfg.body_ids]
+    if wheel_positions_w.shape[1] != 2:
+        raise ValueError("TRON1A wheel contact expects exactly two wheel bodies.")
+
+    force_confidences = []
+    plane_centroids = []
+    plane_normals = []
+    plane_validities = []
+    for contact_name, terrain_name in zip(contact_sensor_names, terrain_sensor_names):
+        contact_sensor: ContactSensor = env.scene.sensors[contact_name]
+        force_confidence = contact_confidence_from_force_history(
+            _filtered_contact_force_history(contact_sensor),
+            force_off=force_off,
+            force_on=force_on,
+        )
+        if force_confidence.shape[1] != 1:
+            raise RuntimeError(
+                f"Ground-contact sensor '{contact_name}' must resolve exactly one wheel body, "
+                f"got {force_confidence.shape[1]}."
+            )
+        force_confidences.append(force_confidence[:, 0])
+
+        terrain_sensor: RayCaster = env.scene.sensors[terrain_name]
+        centroid, normal, valid = _terrain_plane(terrain_sensor)
+        plane_centroids.append(centroid)
+        plane_normals.append(normal)
+        plane_validities.append(valid)
+
+    force_confidence = torch.stack(force_confidences, dim=1)
+    geometry_confidence = wheel_clearance_confidence(
+        wheel_positions_w,
+        torch.stack(plane_centroids, dim=1),
+        torch.stack(plane_normals, dim=1),
+        torch.stack(plane_validities, dim=1),
+        wheel_radius=wheel_radius,
+        tolerance_on=geometry_tolerance_on,
+        tolerance_off=geometry_tolerance_off,
+    )
+    return force_confidence * geometry_confidence
+
+
+def track_lin_vel_xy_exp_all_wheels_ground(
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    contact_sensor_names: tuple[str, str],
+    terrain_sensor_names: tuple[str, str],
+    wheel_radius: float = 0.128,
+    force_off: float = 5.0,
+    force_on: float = 10.0,
+    geometry_tolerance_on: float = 0.02,
+    geometry_tolerance_off: float = 0.035,
+) -> torch.Tensor:
+    """Track planar velocity only while both wheels have valid ground contact."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    error = torch.sum(
+        torch.square(env.command_manager.get_command(command_name)[:, :2] - asset.data.root_lin_vel_b[:, :2]),
+        dim=1,
+    )
+    reward = torch.exp(-error / std**2)
+    contact = _wheel_ground_contact_confidence(
+        env,
+        asset_cfg,
+        contact_sensor_names,
+        terrain_sensor_names,
+        wheel_radius,
+        force_off,
+        force_on,
+        geometry_tolerance_on,
+        geometry_tolerance_off,
+    )
+    return reward * all_support_confidence(contact)
+
+
+def track_ang_vel_z_exp_all_wheels_ground(
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    contact_sensor_names: tuple[str, str],
+    terrain_sensor_names: tuple[str, str],
+    wheel_radius: float = 0.128,
+    force_off: float = 5.0,
+    force_on: float = 10.0,
+    geometry_tolerance_on: float = 0.02,
+    geometry_tolerance_off: float = 0.035,
+) -> torch.Tensor:
+    """Track yaw rate only while both wheels have valid ground contact."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    error = torch.square(env.command_manager.get_command(command_name)[:, 2] - asset.data.root_ang_vel_b[:, 2])
+    reward = torch.exp(-error / std**2)
+    contact = _wheel_ground_contact_confidence(
+        env,
+        asset_cfg,
+        contact_sensor_names,
+        terrain_sensor_names,
+        wheel_radius,
+        force_off,
+        force_on,
+        geometry_tolerance_on,
+        geometry_tolerance_off,
+    )
+    return reward * all_support_confidence(contact)
+
+
+def body_height_command_plane_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track commanded base height along the fitted local terrain normal."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
+    centroid, normal, valid = _terrain_plane(sensor)
+    target_height = env.command_manager.get_command(command_name)[:, 0]
+    return base_height_plane_error_l2(asset.data.root_link_pos_w, target_height, centroid, normal, valid)
+
+
+def wheel_ground_contact_loss(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    contact_sensor_names: tuple[str, str],
+    terrain_sensor_names: tuple[str, str],
+    wheel_radius: float = 0.128,
+    force_off: float = 5.0,
+    force_on: float = 10.0,
+    geometry_tolerance_on: float = 0.02,
+    geometry_tolerance_off: float = 0.035,
+) -> torch.Tensor:
+    """Return the continuous number of wheels missing valid ground contact."""
+    confidence = _wheel_ground_contact_confidence(
+        env,
+        asset_cfg,
+        contact_sensor_names,
+        terrain_sensor_names,
+        wheel_radius,
+        force_off,
+        force_on,
+        geometry_tolerance_on,
+        geometry_tolerance_off,
+    )
+    return torch.sum(1.0 - confidence, dim=1)
+
+
+def both_wheels_airborne(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 1.0,
+) -> torch.Tensor:
+    """Return the instantaneous AIRBORNE state without implying termination."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    forces = torch.linalg.vector_norm(sensor.data.net_forces_w[:, sensor_cfg.body_ids], dim=-1)
+    return torch.all(forces < threshold, dim=1)
+
+
+def wheel_air_time_l2(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    max_air_time: float = 1.0,
+) -> torch.Tensor:
+    """Penalize current per-wheel air time, capped to keep reward scale bounded."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    air_time = sensor.data.current_air_time
+    if air_time is None:
+        air_time = sensor.data.last_air_time
+    if air_time is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    air_time = torch.clamp(air_time[:, sensor_cfg.body_ids], min=0.0, max=max_air_time)
+    return torch.sum(torch.square(air_time), dim=1)
+
+
+def all_wheels_air_time_l2(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    max_air_time: float = 1.0,
+) -> torch.Tensor:
+    """Penalize only the time for which all configured supports are airborne."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    air_time = sensor.data.current_air_time
+    if air_time is None:
+        air_time = sensor.data.last_air_time
+    if air_time is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    simultaneous_air_time = torch.amin(air_time[:, sensor_cfg.body_ids], dim=1)
+    return torch.square(torch.clamp(simultaneous_air_time, min=0.0, max=max_air_time))
+
+
+def wheel_rolling_velocity_error(
+    env: ManagerBasedRLEnv,
+    radius: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize mismatch between average wheel surface speed and base forward speed."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_speed = torch.mean(torch.abs(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1) * radius
+    base_forward_speed = torch.abs(asset.data.root_lin_vel_b[:, 0])
+    return torch.square(wheel_speed - base_forward_speed)
+
+
+def terrain_aligned_orientation_l2(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize base-up misalignment with the fitted local terrain normal."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    sensor: RayCaster = env.scene.sensors[sensor_cfg.name]
+    _, normal, valid = _terrain_plane(sensor)
+    base_up_b = torch.zeros(env.num_envs, 3, device=asset.device)
+    base_up_b[:, 2] = 1.0
+    base_up_w = math_utils.quat_apply(asset.data.root_link_quat_w, base_up_b)
+    return terrain_orientation_penalty(base_up_w, normal, valid)
+
+
+def wheel_horizontal_neutral_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    neutral_xy: tuple[tuple[float, float], tuple[float, float]],
+    tolerance_xy: tuple[float, float] = (0.04, 0.03),
+    scale_xy: tuple[float, float] = (0.02, 0.02),
+) -> torch.Tensor:
+    """Penalize wheel centers leaving their horizontal neutral points in the base frame."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_pos_w = asset.data.body_link_pos_w[:, asset_cfg.body_ids]
+    relative_w = wheel_pos_w - asset.data.root_link_pos_w.unsqueeze(1)
+    base_quat = asset.data.root_link_quat_w.unsqueeze(1).expand(-1, wheel_pos_w.shape[1], -1)
+    wheel_pos_b = math_utils.quat_apply_inverse(base_quat, relative_w)
+
+    neutral = torch.as_tensor(neutral_xy, device=wheel_pos_b.device, dtype=wheel_pos_b.dtype)
+    tolerance = torch.as_tensor(tolerance_xy, device=wheel_pos_b.device, dtype=wheel_pos_b.dtype).expand_as(neutral)
+    scale = torch.as_tensor(scale_xy, device=wheel_pos_b.device, dtype=wheel_pos_b.dtype).expand_as(neutral)
+    return horizontal_neutral_penalty(wheel_pos_b, neutral, tolerance, scale)
+
+
+def wheel_landing_impact_l2(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    force_threshold: float = 100.0,
+    force_scale: float = 100.0,
+) -> torch.Tensor:
+    """Penalize excessive force when a wheel establishes a new contact."""
+    sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
+    force_w = sensor.data.net_forces_w[:, sensor_cfg.body_ids]
+    return landing_impact_l2(first_contact, force_w, force_threshold=force_threshold, force_scale=force_scale)
+
+
+def wheel_stance_slip_l2(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    terrain_sensor_cfg: SceneEntityCfg,
+    wheel_radius: float = 0.128,
+    force_off: float = 5.0,
+    force_on: float = 10.0,
+) -> torch.Tensor:
+    """Penalize estimated wheel contact-point slip while the wheel is supporting."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    terrain_sensor: RayCaster = env.scene.sensors[terrain_sensor_cfg.name]
+    _, normal, valid = _terrain_plane(terrain_sensor)
+    contact = _wheel_contact_confidence(
+        contact_sensor,
+        sensor_cfg.body_ids,
+        force_off=force_off,
+        force_on=force_on,
+    )
+    return rolling_contact_slip_l2(
+        asset.data.body_link_lin_vel_w[:, asset_cfg.body_ids],
+        asset.data.body_link_ang_vel_w[:, asset_cfg.body_ids],
+        normal,
+        contact,
+        wheel_radius=wheel_radius,
+        plane_valid=valid,
+    )
+
+
+def wheel_swing_height_tracking(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+    terrain_sensor_cfg: SceneEntityCfg,
+    wheel_radius: float = 0.128,
+    force_off: float = 5.0,
+    force_on: float = 10.0,
+) -> torch.Tensor:
+    """Track gait-commanded swing clearance for non-contact wheel links."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    terrain_sensor: RayCaster = env.scene.sensors[terrain_sensor_cfg.name]
+
+    contact = _wheel_contact_confidence(
+        contact_sensor,
+        sensor_cfg.body_ids,
+        force_off=force_off,
+        force_on=force_on,
+    )
+    swing_mask = contact < 0.5
+    commanded_height = env.command_manager.get_command(command_name)[:, 3].unsqueeze(1)
+
+    ray_height = terrain_sensor.data.ray_hits_w[..., 2]
+    ray_height = torch.where(torch.isfinite(ray_height), ray_height, torch.nan)
+    ground_height = torch.nanmedian(ray_height, dim=1).values
+    ground_height = torch.nan_to_num(ground_height, nan=0.0, posinf=0.0, neginf=0.0).unsqueeze(1)
+
+    wheel_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2] - ground_height - wheel_radius
+    error = torch.square(wheel_height - commanded_height) * swing_mask.float()
+    active_feet = torch.clamp(torch.sum(swing_mask.float(), dim=1), min=1.0)
+    return torch.sum(error, dim=1) / active_feet
