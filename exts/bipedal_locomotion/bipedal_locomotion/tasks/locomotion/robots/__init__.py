@@ -5,6 +5,7 @@ from bipedal_locomotion.tasks.locomotion.agents.limx_rsl_rl_ppo_cfg import (
     SF_TRON1AFlatPPORunnerCfg,
     WF_TRON1AFootAllTerrainPPORunnerCfg,
     WF_TRON1AFlatPPORunnerCfg,
+    WF_TRON1AWheelHeightPretrainPPORunnerCfg,
     WF_TRON1AWheelModePPORunnerCfg,
 )
 
@@ -17,6 +18,7 @@ from . import limx_pointfoot_env_cfg, limx_solefoot_env_cfg, limx_wheelfoot_env_
 limx_pf_blind_flat_runner_cfg = PF_TRON1AFlatPPORunnerCfg()
 
 limx_wf_blind_flat_runner_cfg = WF_TRON1AFlatPPORunnerCfg()
+limx_wf_wheel_height_pretrain_runner_cfg = WF_TRON1AWheelHeightPretrainPPORunnerCfg()
 limx_wf_wheel_mode_runner_cfg = WF_TRON1AWheelModePPORunnerCfg()
 limx_wf_foot_all_terrain_runner_cfg = WF_TRON1AFootAllTerrainPPORunnerCfg()
 
@@ -101,6 +103,16 @@ gym.register(
 ####################################
 # WF dual-expert locomotion tasks
 ####################################
+
+gym.register(
+    id="Isaac-Limx-WF-Wheel-Height-Pretrain-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": limx_wheelfoot_mode_env_cfg.WFWheelHeightPretrainEnvCfg,
+        "rsl_rl_cfg_entry_point": limx_wf_wheel_height_pretrain_runner_cfg,
+    },
+)
 
 gym.register(
     id="Isaac-Limx-WF-Wheel-Mode-v0",

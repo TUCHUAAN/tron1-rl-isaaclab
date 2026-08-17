@@ -21,11 +21,16 @@ from .reward_math import (
     base_height_plane_error_l2,
     contact_confidence_from_force_history,
     fit_height_plane,
+    height_command_transition_scale,
     horizontal_neutral_penalty,
     landing_impact_l2,
+    mean_support_confidence,
     rolling_contact_slip_l2,
     terrain_orientation_penalty,
     wheel_clearance_confidence,
+    wheel_target_symmetry_penalty,
+    zero_command_yaw_rate_penalty,
+    zero_command_wheel_target_penalty,
 )
 
 if TYPE_CHECKING:
@@ -64,6 +69,29 @@ def joint_powers_l1(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEnt
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.abs(torch.mul(asset.data.applied_torque, asset.data.joint_vel)), dim=1)
+
+
+def lin_vel_z_height_command_gated_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    min_scale: float = 0.2,
+    full_penalty_gap: float = 0.01,
+    reduced_penalty_gap: float = 0.04,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize vertical base velocity less while the height command is slewing."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    command_term = env.command_manager.get_term(command_name)
+    if not hasattr(command_term, "target"):
+        raise AttributeError(f"Command term {command_name!r} does not expose a sampled target.")
+    scale = height_command_transition_scale(
+        command_term.command[:, 0],
+        command_term.target[:, 0],
+        min_scale=min_scale,
+        full_penalty_gap=full_penalty_gap,
+        reduced_penalty_gap=reduced_penalty_gap,
+    )
+    return torch.square(asset.data.root_lin_vel_b[:, 2]) * scale
 
 
 def no_fly(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg, threshold: float = 1.0) -> torch.Tensor:
@@ -608,31 +636,17 @@ def _filtered_contact_force_history(sensor: ContactSensor) -> torch.Tensor:
     return torch.sum(history, dim=3)
 
 
-def _wheel_ground_contact_confidence(
+def _wheel_ground_force_confidence(
     env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
     contact_sensor_names: tuple[str, str],
-    terrain_sensor_names: tuple[str, str],
-    wheel_radius: float,
     force_off: float,
     force_on: float,
-    geometry_tolerance_on: float,
-    geometry_tolerance_off: float,
 ) -> torch.Tensor:
-    """Combine filtered support force and wheel-local ground clearance for both wheels."""
-    if len(contact_sensor_names) != 2 or len(terrain_sensor_names) != 2:
-        raise ValueError("TRON1A wheel contact requires exactly two contact sensors and two terrain sensors.")
-
-    asset: Articulation = env.scene[asset_cfg.name]
-    wheel_positions_w = asset.data.body_link_pos_w[:, asset_cfg.body_ids]
-    if wheel_positions_w.shape[1] != 2:
-        raise ValueError("TRON1A wheel contact expects exactly two wheel bodies.")
-
+    """Return continuous per-wheel confidence from ground-filtered force history."""
+    if len(contact_sensor_names) != 2:
+        raise ValueError("TRON1A wheel support requires exactly two ground-contact sensors.")
     force_confidences = []
-    plane_centroids = []
-    plane_normals = []
-    plane_validities = []
-    for contact_name, terrain_name in zip(contact_sensor_names, terrain_sensor_names):
+    for contact_name in contact_sensor_names:
         contact_sensor: ContactSensor = env.scene.sensors[contact_name]
         force_confidence = contact_confidence_from_force_history(
             _filtered_contact_force_history(contact_sensor),
@@ -645,6 +659,39 @@ def _wheel_ground_contact_confidence(
                 f"got {force_confidence.shape[1]}."
             )
         force_confidences.append(force_confidence[:, 0])
+    return torch.stack(force_confidences, dim=1)
+
+
+def _wheel_ground_contact_confidence(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    contact_sensor_names: tuple[str, str],
+    terrain_sensor_names: tuple[str, str],
+    wheel_radius: float,
+    force_off: float,
+    force_on: float,
+    geometry_tolerance_on: float,
+    geometry_tolerance_off: float,
+) -> torch.Tensor:
+    """Combine filtered support force and wheel-local ground clearance for both wheels."""
+    if len(terrain_sensor_names) != 2:
+        raise ValueError("TRON1A wheel contact requires exactly two terrain sensors.")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_positions_w = asset.data.body_link_pos_w[:, asset_cfg.body_ids]
+    if wheel_positions_w.shape[1] != 2:
+        raise ValueError("TRON1A wheel contact expects exactly two wheel bodies.")
+
+    force_confidence = _wheel_ground_force_confidence(
+        env,
+        contact_sensor_names,
+        force_off,
+        force_on,
+    )
+    plane_centroids = []
+    plane_normals = []
+    plane_validities = []
+    for terrain_name in terrain_sensor_names:
 
         terrain_sensor: RayCaster = env.scene.sensors[terrain_name]
         centroid, normal, valid = _terrain_plane(terrain_sensor)
@@ -652,7 +699,6 @@ def _wheel_ground_contact_confidence(
         plane_normals.append(normal)
         plane_validities.append(valid)
 
-    force_confidence = torch.stack(force_confidences, dim=1)
     geometry_confidence = wheel_clearance_confidence(
         wheel_positions_w,
         torch.stack(plane_centroids, dim=1),
@@ -663,6 +709,21 @@ def _wheel_ground_contact_confidence(
         tolerance_off=geometry_tolerance_off,
     )
     return force_confidence * geometry_confidence
+
+
+def stand_still_grounded(
+    env: ManagerBasedRLEnv,
+    contact_sensor_names: tuple[str, str],
+    force_off: float = 5.0,
+    force_on: float = 10.0,
+    lin_threshold: float = 0.05,
+    ang_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize zero-command motion only while the wheels provide ground support."""
+    penalty = stand_still(env, lin_threshold, ang_threshold, asset_cfg)
+    confidence = _wheel_ground_force_confidence(env, contact_sensor_names, force_off, force_on)
+    return penalty * mean_support_confidence(confidence)
 
 
 def track_lin_vel_xy_exp_all_wheels_ground(
@@ -744,6 +805,36 @@ def body_height_command_plane_l2(
     return base_height_plane_error_l2(asset.data.root_link_pos_w, target_height, centroid, normal, valid)
 
 
+def body_height_command_grounded_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    contact_sensor_names: tuple[str, str],
+    force_off: float = 5.0,
+    force_on: float = 10.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Track vertical body height with a continuous ground-support gate."""
+    penalty = body_height_command_l2(env, command_name, asset_cfg, sensor_cfg)
+    confidence = _wheel_ground_force_confidence(env, contact_sensor_names, force_off, force_on)
+    return penalty * mean_support_confidence(confidence)
+
+
+def body_height_command_plane_grounded_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    contact_sensor_names: tuple[str, str],
+    force_off: float = 5.0,
+    force_on: float = 10.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track plane-relative body height with a continuous ground-support gate."""
+    penalty = body_height_command_plane_l2(env, command_name, sensor_cfg, asset_cfg)
+    confidence = _wheel_ground_force_confidence(env, contact_sensor_names, force_off, force_on)
+    return penalty * mean_support_confidence(confidence)
+
+
 def wheel_ground_contact_loss(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -823,6 +914,84 @@ def wheel_rolling_velocity_error(
     wheel_speed = torch.mean(torch.abs(asset.data.joint_vel[:, asset_cfg.joint_ids]), dim=1) * radius
     base_forward_speed = torch.abs(asset.data.root_lin_vel_b[:, 0])
     return torch.square(wheel_speed - base_forward_speed)
+
+
+def wheel_target_symmetry_l2(
+    env: ManagerBasedRLEnv,
+    action_name: str,
+    command_name: str,
+    yaw_threshold: float = 0.05,
+    target_difference_tolerance: float = 0.10,
+) -> torch.Tensor:
+    """Penalize differential wheel targets when no yaw motion is commanded."""
+    wheel_targets = env.action_manager.get_term(action_name).processed_actions
+    yaw_commands = env.command_manager.get_command(command_name)[:, 2]
+    return wheel_target_symmetry_penalty(
+        wheel_targets,
+        yaw_commands,
+        yaw_threshold,
+        target_difference_tolerance,
+    )
+
+
+def zero_command_wheel_target_l2(
+    env: ManagerBasedRLEnv,
+    action_name: str,
+    command_name: str,
+    linear_threshold: float = 0.05,
+    angular_threshold: float = 0.05,
+    target_tolerance: float = 0.15,
+) -> torch.Tensor:
+    """Penalize wheel targets outside a small dead-zone under a zero velocity command."""
+    wheel_targets = env.action_manager.get_term(action_name).processed_actions
+    velocity_commands = env.command_manager.get_command(command_name)[:, :3]
+    return zero_command_wheel_target_penalty(
+        wheel_targets,
+        velocity_commands,
+        linear_threshold,
+        angular_threshold,
+        target_tolerance,
+    )
+
+
+def zero_command_yaw_rate_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    linear_threshold: float = 0.05,
+    angular_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize actual base yaw rate under a zero planar velocity command."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    velocity_commands = env.command_manager.get_command(command_name)[:, :3]
+    return zero_command_yaw_rate_penalty(
+        asset.data.root_ang_vel_b[:, 2],
+        velocity_commands,
+        linear_threshold,
+        angular_threshold,
+    )
+
+
+def zero_command_yaw_rate_grounded_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    contact_sensor_names: tuple[str, str],
+    force_off: float = 5.0,
+    force_on: float = 10.0,
+    linear_threshold: float = 0.05,
+    angular_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize zero-command yaw rate only while the wheels support the robot."""
+    penalty = zero_command_yaw_rate_l2(
+        env,
+        command_name,
+        linear_threshold,
+        angular_threshold,
+        asset_cfg,
+    )
+    confidence = _wheel_ground_force_confidence(env, contact_sensor_names, force_off, force_on)
+    return penalty * mean_support_confidence(confidence)
 
 
 def terrain_aligned_orientation_l2(

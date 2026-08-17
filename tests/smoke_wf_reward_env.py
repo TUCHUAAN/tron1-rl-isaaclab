@@ -53,12 +53,79 @@ def main() -> None:
     if "both_wheels_airborne" in unwrapped.termination_manager.active_terms:
         raise AssertionError("AIRBORNE must not be registered as a termination.")
 
+    active_rewards = set(unwrapped.reward_manager.active_terms)
+    if "pen_base_contact_termination" not in active_rewards:
+        raise AssertionError("Missing base-contact termination penalty.")
+    termination_reward_cfg = unwrapped.reward_manager.get_term_cfg("pen_base_contact_termination")
+    if termination_reward_cfg.func.__name__ != "is_terminated":
+        raise AssertionError(
+            "Termination penalty must use the current-step non-timeout signal, got "
+            f"{termination_reward_cfg.func.__name__}."
+        )
+    if "term_keys" in termination_reward_cfg.params:
+        raise AssertionError("Termination penalty must not read persistent per-term termination history.")
+    if termination_reward_cfg.weight != -500.0:
+        raise AssertionError(f"Unexpected termination penalty weight: {termination_reward_cfg.weight}")
+    unexpected_non_timeout_terms = {
+        name
+        for name in unwrapped.termination_manager.active_terms
+        if not unwrapped.termination_manager.get_term_cfg(name).time_out and name != "base_contact"
+    }
+    if unexpected_non_timeout_terms:
+        raise AssertionError(
+            "is_terminated would also penalize unexpected non-timeout terms: "
+            f"{sorted(unexpected_non_timeout_terms)}"
+        )
+
+    height_cfg = unwrapped.reward_manager.get_term_cfg("pen_base_height")
+    if "grounded" not in height_cfg.func.__name__:
+        raise AssertionError(f"Height penalty is not support-gated: {height_cfg.func.__name__}")
+    stand_cfg = unwrapped.reward_manager.get_term_cfg("stand_still")
+    if stand_cfg.func.__name__ != "stand_still_grounded":
+        raise AssertionError(f"Stand-still penalty is not support-gated: {stand_cfg.func.__name__}")
+
+    height_cfg = unwrapped.command_manager.get_term("body_height").cfg
+    if height_cfg.ranges.height != (0.65, 0.85) or height_cfg.endpoint_fraction != 0.20:
+        raise AssertionError(
+            f"Unexpected height sampling: range={height_cfg.ranges.height}, "
+            f"endpoint_fraction={height_cfg.endpoint_fraction}"
+        )
+
     if "Wheel-Mode" in args.task:
-        active_rewards = set(unwrapped.reward_manager.active_terms)
-        expected_rewards = {"pen_wheel_contact", "pen_wheel_horizontal_neutral"}
+        expected_rewards = {
+            "pen_wheel_contact",
+            "pen_wheel_horizontal_neutral",
+            "pen_wheel_target_symmetry",
+            "pen_zero_command_wheel_target",
+            "pen_zero_command_yaw_rate",
+        }
         missing_rewards = expected_rewards - active_rewards
         if missing_rewards:
             raise AssertionError(f"Missing new Wheel rewards: {sorted(missing_rewards)}")
+
+        zero_target_cfg = unwrapped.reward_manager.get_term_cfg("pen_zero_command_wheel_target")
+        if zero_target_cfg.weight != -0.10 or zero_target_cfg.params["target_tolerance"] != 0.15:
+            raise AssertionError(
+                "Unexpected zero-command wheel-target constraint: "
+                f"weight={zero_target_cfg.weight}, tolerance={zero_target_cfg.params['target_tolerance']}"
+            )
+        zero_yaw_cfg = unwrapped.reward_manager.get_term_cfg("pen_zero_command_yaw_rate")
+        if zero_yaw_cfg.func.__name__ != "zero_command_yaw_rate_grounded_l2":
+            raise AssertionError(f"Zero-command yaw penalty is not support-gated: {zero_yaw_cfg.func.__name__}")
+        wheel_height_cfg = unwrapped.reward_manager.get_term_cfg("pen_base_height")
+        if wheel_height_cfg.weight != -60.0:
+            raise AssertionError(f"Unexpected Wheel height penalty weight: {wheel_height_cfg.weight}")
+        vertical_cfg = unwrapped.reward_manager.get_term_cfg("pen_lin_vel_z")
+        if vertical_cfg.func.__name__ != "lin_vel_z_height_command_gated_l2":
+            raise AssertionError(f"Vertical velocity penalty is not height-transition-gated: {vertical_cfg.func.__name__}")
+        expected_vertical_params = {
+            "min_scale": 0.2,
+            "full_penalty_gap": 0.01,
+            "reduced_penalty_gap": 0.04,
+        }
+        for name, expected in expected_vertical_params.items():
+            if vertical_cfg.params[name] != expected:
+                raise AssertionError(f"Unexpected vertical gate {name}: {vertical_cfg.params[name]}")
         removed_rewards = {
             "rew_same_foot_x_position",
             "pen_feet_distance",

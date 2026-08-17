@@ -163,6 +163,14 @@ class WF_TRON1AWheelModePPORunnerCfg(WF_TRON1AFlatPPORunnerCfg):
 
 
 @configclass
+class WF_TRON1AWheelHeightPretrainPPORunnerCfg(WF_TRON1AWheelModePPORunnerCfg):
+    """PPO runner for the flat height-control pretraining stage."""
+
+    max_iterations = 5000
+    experiment_name = "wf_tron_1a_wheel_height_pretrain"
+
+
+@configclass
 class WF_TRON1AFootAllTerrainPPORunnerCfg(WF_TRON1AFlatPPORunnerCfg):
     """PPO runner for the wheel-locked all-terrain foot expert."""
 

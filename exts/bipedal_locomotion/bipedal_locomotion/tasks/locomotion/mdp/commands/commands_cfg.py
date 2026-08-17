@@ -49,3 +49,9 @@ class UniformBodyHeightCommandCfg(CommandTermCfg):
     resampling_time_range: tuple[float, float] = (5.0, 8.0)
     max_rate: float = 0.08
     """Maximum command slew rate in metres per second."""
+    endpoint_fraction: float = 0.0
+    """Fraction of resamples assigned equally to the exact minimum and maximum heights."""
+    asset_name: str = "robot"
+    """Articulation whose base height is tracked for command metrics."""
+    height_sensor_name: str = "height_scanner"
+    """Ray caster used to measure height relative to the local terrain plane."""

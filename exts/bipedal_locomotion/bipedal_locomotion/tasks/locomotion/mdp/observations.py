@@ -166,6 +166,16 @@ def generated_commands(env: ManagerBasedRLEnv, command_name: str) -> torch.Tenso
     """The generated command from command term in the command manager with the given name."""
     return env.command_manager.get_command(command_name)
 
+
+def normalized_body_height_command(env: ManagerBasedRLEnv, command_name: str) -> torch.Tensor:
+    """Return a body-height command normalized from its configured metre range to ``[0, 1]``."""
+    command = env.command_manager.get_command(command_name)
+    command_term = env.command_manager.get_term(command_name)
+    minimum, maximum = command_term.cfg.ranges.height
+    if maximum <= minimum:
+        raise ValueError(f"Invalid body-height range [{minimum}, {maximum}].")
+    return torch.clamp((command - minimum) / (maximum - minimum), min=0.0, max=1.0)
+
 def joint_pos_rel_exclude_wheel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
                                 wheel_joints_name: list[str] = ["wheel_[RL]_Joint"] 
                                 ) -> torch.Tensor:

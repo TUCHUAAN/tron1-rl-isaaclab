@@ -27,6 +27,7 @@ DEFAULT_ROBOT_XML = Path(
     "/home/tuchuaan/tron1-mujoco-sim/robot-description/pointfoot/WF_TRON1A/xml/robot.xml"
 )
 DEFAULT_CHECKPOINT_ROOT = REPO_ROOT / "logs" / "rsl_rl" / "wf_tron_1a_wheel_mode"
+STABILITY_SELECTION_FILE = "selected_stability_checkpoint.txt"
 
 PHYSICS_DT = 0.005
 POLICY_DECIMATION = 4
@@ -36,6 +37,8 @@ POLICY_OBS_DIM = 155
 HISTORY_OBS_DIM = 34
 COMMAND_DIM = 4
 ACTION_DIM = 8
+BODY_HEIGHT_MIN = 0.65
+BODY_HEIGHT_MAX = 0.85
 
 # This is the PhysX tensor order recorded by the training environment.  It is
 # intentionally different from the left-chain/right-chain order in the MJCF.
@@ -197,6 +200,25 @@ def select_or_reuse_terrain_region_on_reset(
 
 
 def discover_latest_checkpoint(checkpoint_root: Path) -> Path:
+    selection_files = sorted(
+        checkpoint_root.glob(f"*/{STABILITY_SELECTION_FILE}"),
+        key=lambda path: (path.stat().st_mtime_ns, str(path)),
+        reverse=True,
+    )
+    for selection_file in selection_files:
+        try:
+            selected_text = selection_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not selected_text:
+            continue
+        selected = Path(selected_text).expanduser()
+        if not selected.is_absolute():
+            selected = selection_file.parent / selected
+        if selected.is_file():
+            print(f"使用稳定性指标选出的 checkpoint：{selected}")
+            return selected
+
     candidates = tuple(checkpoint_root.glob("**/model_*.pt"))
     if not candidates:
         raise FileNotFoundError(f"没有在 {checkpoint_root} 中找到 model_*.pt")
@@ -256,6 +278,35 @@ def _model_id(model: mujoco.MjModel, object_type: mujoco.mjtObj, name: str) -> i
     if object_id < 0:
         raise ValueError(f"MuJoCo 模型缺少 {object_type.name}: {name}")
     return object_id
+
+
+def checkpoint_body_height_range(checkpoint_path: Path) -> tuple[float, float]:
+    """Read the training height range saved beside a checkpoint when available."""
+    env_config = checkpoint_path.parent / "params" / "env.yaml"
+    if not env_config.is_file():
+        return BODY_HEIGHT_MIN, BODY_HEIGHT_MAX
+    try:
+        text = env_config.read_text(encoding="utf-8")
+    except OSError:
+        return BODY_HEIGHT_MIN, BODY_HEIGHT_MAX
+
+    commands_index = text.find("\ncommands:\n")
+    body_height_index = text.find("\n  body_height:\n", max(commands_index, 0))
+    if body_height_index < 0:
+        return BODY_HEIGHT_MIN, BODY_HEIGHT_MAX
+    gait_index = text.find("\n  gait_command:\n", body_height_index)
+    section = text[body_height_index : gait_index if gait_index >= 0 else None]
+    match = re.search(
+        r"\n\s+ranges:\n\s+height:.*?\n\s+-\s+([-+0-9.eE]+)\n\s+-\s+([-+0-9.eE]+)",
+        section,
+        flags=re.DOTALL,
+    )
+    if match is None:
+        return BODY_HEIGHT_MIN, BODY_HEIGHT_MAX
+    minimum, maximum = (float(match.group(1)), float(match.group(2)))
+    if not math.isfinite(minimum) or not math.isfinite(maximum) or maximum <= minimum:
+        raise ValueError(f"checkpoint 高度范围无效：[{minimum}, {maximum}]")
+    return minimum, maximum
 
 
 class TerrainHeightScanner:
@@ -333,11 +384,13 @@ class WheelPolicy:
         device: torch.device,
         model: mujoco.MjModel,
         scanner: TerrainHeightScanner,
+        body_height_range: tuple[float, float],
     ) -> None:
         self.checkpoint_path = checkpoint_path
         self.device = device
         self.model = model
         self.scanner = scanner
+        self.body_height_min, self.body_height_max = body_height_range
         checkpoint = torch.load(
             checkpoint_path, map_location="cpu", weights_only=False
         )
@@ -469,10 +522,17 @@ class WheelPolicy:
                 f"策略观测维度为 {policy_observation.size}，预期 {POLICY_OBS_DIM}。"
             )
 
+        network_command = command.copy()
+        network_command[3] = np.clip(
+            (network_command[3] - self.body_height_min)
+            / (self.body_height_max - self.body_height_min),
+            0.0,
+            1.0,
+        )
         with torch.inference_mode():
             history_tensor = torch.from_numpy(history).unsqueeze(0).to(self.device)
             policy_tensor = torch.from_numpy(policy_observation).unsqueeze(0).to(self.device)
-            command_tensor = torch.from_numpy(command).unsqueeze(0).to(self.device)
+            command_tensor = torch.from_numpy(network_command).unsqueeze(0).to(self.device)
             latent = self.encoder(history_tensor)
             action = self.actor(torch.cat((latent, policy_tensor, command_tensor), dim=-1))
         result = action[0].detach().cpu().numpy().astype(np.float32, copy=False)
@@ -552,9 +612,10 @@ class KeyboardCommandState:
         glfw.KEY_D,
     }
 
-    def __init__(self, body_height: float) -> None:
+    def __init__(self, body_height: float, body_height_range: tuple[float, float]) -> None:
         self.pressed: set[int] = set()
         self.body_height = body_height
+        self.body_height_min, self.body_height_max = body_height_range
 
     def handle_key(self, key: int, action: int) -> None:
         if action not in (glfw.PRESS, glfw.RELEASE, glfw.REPEAT):
@@ -589,8 +650,8 @@ class KeyboardCommandState:
         self.body_height = float(
             np.clip(
                 self.body_height + z_semantic * height_rate * POLICY_DT,
-                0.75,
-                0.85,
+                self.body_height_min,
+                self.body_height_max,
             )
         )
         return np.asarray(
@@ -737,8 +798,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--max-steps", type=int, default=None, help="Optional number of physics steps."
     )
     args = parser.parse_args(argv)
-    if not 0.75 <= args.body_height <= 0.85:
-        parser.error("--body-height 必须在 [0.75, 0.85] 内。")
     if args.render_hz <= 0.0:
         parser.error("--render-hz 必须大于 0。")
     if args.max_steps is not None and args.max_steps <= 0:
@@ -779,6 +838,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint 不存在：{checkpoint}")
+    body_height_range = checkpoint_body_height_range(checkpoint)
+    if not body_height_range[0] <= args.body_height <= body_height_range[1]:
+        raise ValueError(
+            f"--body-height 必须在 checkpoint 的训练范围 "
+            f"[{body_height_range[0]}, {body_height_range[1]}] 内。"
+        )
     device = resolve_device(args.device)
 
     model = build_scene_model(
@@ -789,7 +854,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     data = mujoco.MjData(model)
     base_body_id = _model_id(model, mujoco.mjtObj.mjOBJ_BODY, "base_Link")
     scanner = TerrainHeightScanner(model, base_body_id)
-    policy = WheelPolicy(checkpoint, device, model, scanner)
+    policy = WheelPolicy(checkpoint, device, model, scanner, body_height_range)
     torque_controller = TorqueController(model)
     rng = np.random.default_rng(args.seed)
     gait_command = np.asarray(
@@ -801,7 +866,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         dtype=np.float32,
     )
-    command_state = KeyboardCommandState(args.body_height)
+    command_state = KeyboardCommandState(args.body_height, body_height_range)
     spawn_xy, spawn_yaw = reset_robot(
         model, data, region, rng, args.spawn_z_offset
     )
@@ -809,7 +874,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _print_help(checkpoint, region, spawn_xy, spawn_yaw)
     print(
         f"[runtime] checkpoint_iter={policy.iteration}, device={device}, "
-        f"physics_dt={PHYSICS_DT}, policy_dt={POLICY_DT}"
+        f"physics_dt={PHYSICS_DT}, policy_dt={POLICY_DT}, "
+        f"height_range={body_height_range}"
     )
 
     window = None

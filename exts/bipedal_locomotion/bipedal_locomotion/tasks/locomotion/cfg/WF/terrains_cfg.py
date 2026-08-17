@@ -166,6 +166,21 @@ STAIRS_TERRAINS_PLAY_CFG = TerrainGeneratorCfg(
 # Wheelfoot dual-expert terrain curricula
 ########################################
 
+WHEEL_HEIGHT_PRETRAIN_TERRAINS_CFG = TerrainGeneratorCfg(
+    seed=42,
+    size=(8.0, 8.0),
+    border_width=20.0,
+    num_rows=10,
+    num_cols=16,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=True,
+    sub_terrains={"flat": MeshPlaneTerrainCfg(proportion=1.0)},
+    curriculum=False,
+    difficulty_range=(0.0, 0.0),
+)
+
 WHEEL_MODE_TERRAINS_CFG = TerrainGeneratorCfg(
     seed=42,
     size=(8.0, 8.0),
@@ -179,16 +194,24 @@ WHEEL_MODE_TERRAINS_CFG = TerrainGeneratorCfg(
     sub_terrains={
         "flat": MeshPlaneTerrainCfg(proportion=0.15),
         "slope_up": HfPyramidSlopedTerrainCfg(
-            proportion=0.20, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+            proportion=0.175, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
         ),
         "slope_down": HfInvertedPyramidSlopedTerrainCfg(
-            proportion=0.20, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+            proportion=0.175, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
         ),
         "waves": HfWaveTerrainCfg(
-            proportion=0.175, amplitude_range=(0.01, 0.06), num_waves=10, border_width=0.25
+            proportion=0.15, amplitude_range=(0.01, 0.06), num_waves=10, border_width=0.25
         ),
         "random_rough": HfRandomUniformTerrainCfg(
-            proportion=0.175, noise_range=(0.01, 0.06), noise_step=0.01, border_width=0.25
+            proportion=0.15, noise_range=(0.01, 0.06), noise_step=0.01, border_width=0.25
+        ),
+        "stairs_up": MeshPyramidStairsTerrainCfg(
+            proportion=0.10,
+            step_height_range=(0.005, 0.04),
+            step_width=0.35,
+            platform_width=3.0,
+            border_width=1.0,
+            holes=False,
         ),
         "stairs_down": MeshInvertedPyramidStairsTerrainCfg(
             proportion=0.10,

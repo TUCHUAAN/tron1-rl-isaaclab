@@ -177,3 +177,41 @@
 - 测试：纯张量 `7/7 PASS`；Wheel CPU 环境 23 项 reward 冒烟通过；Foot 24 项回归通过；Wheel CPU 1 iteration 生成 `model_1.pt`。
 - 旧 `model_20000.pt` 在新环境 CPU 运行 400 步：双轮接触置信度 >0.5 比例约 98.75%，旧 checkpoint schema 兼容。
 - 修复两次验证问题：补充遗漏的 `ContactSensorCfg` import；CLI device 同步到 PPO runner 后 CPU 训练通过。
+
+## 会话：2026-08-13——高度控制与零命令 yaw 二次修订
+
+- **状态：** implementation_complete_single_stage_retrain_pending
+- 诊断 `2026-08-12_20-23-06_wheel_hnorm_h062_085_stairs004/model_20000.pt`：末段高度 RMS 误差约 `7.8 cm`；MuJoCo 中 `0.62/0.85 m` 端点命令只产生约 `3 cm` 的稳态高度差。
+- Wheel 高度奖励从 `-25` 提升到 `-100`，零命令环境比例从 `10%` 提升到 `25%`。
+- 高度命令增加 `40%` 端点采样：最小/最大高度各 `20%`，其余区间均匀采样。
+- 新增 episode 平均实际高度 `MAE/RMSE` 与命令 slew MAE 指标，替换易误解的旧 `height_command_error`。
+- Wheel 左右轮目标对称权重提升到 `-0.5`；零命令轮目标权重提升到 `-1.0`，死区降到 `0.05 rad/s`；新增零命令实际 `wz²` 惩罚 `-2.0`。
+- 新增 `Isaac-Limx-WF-Wheel-Height-Pretrain-v0` 平地诊断任务和独立日志目录；按用户决定，正式训练不分阶段，改为从零运行 `Wheel-Mode` 全地形 curriculum 20000 iterations。
+- 纯张量单元测试扩展到 10 项并全部通过；完整 Isaac Sim 环境冒烟待执行。
+
+## 会话：2026-08-15——支撑门控与倒地终止惩罚
+
+- **状态：** implementation_complete_single_stage_retrain_pending
+- 诊断 `2026-08-13_18-19-28_wheel_single_stage_h062_085_stairs004/model_20000.pt`：末100次迭代 episode length `608.5/1000`，base contact 终止率 `57.5%`，高度 `MAE 7.26 cm / RMSE 11.78 cm`。
+- 高度范围统一改为 `0.65～0.85 m`，网络输入及 MuJoCo 同步归一化；端点采样从 `40%` 降为 `20%`，最小/最大各 `10%`。
+- 新增地面过滤力的平均支撑置信度：双轮/单轮/腾空门控约为 `1.0/0.5/0.0`；Wheel/Foot 的高度和静止惩罚、Wheel 零命令实际 yaw 惩罚均使用该门控。
+- 原配置新增 `pen_base_contact_termination=-200`，意图只惩罚 `base_contact`；其持久状态误用已按下方记录修复。
+- 零命令轮目标权重从 `-1.0` 回调到 `-0.25`，死区从 `0.05` 恢复到 `0.15 rad/s`；实际 yaw 惩罚 `-2.0` 保留。
+- MuJoCo 默认范围同步为 `0.65～0.85 m`，并会从 checkpoint 邻接的 `params/env.yaml` 自动恢复旧模型的训练范围；旧 `0.62～0.85 m` 模型4步无窗口冒烟通过且正确识别旧范围。
+- 纯张量单元测试扩展到 11 项并通过；完整 Isaac Sim 环境冒烟在应用导入前被 NVIDIA EULA 交互提示阻止，未代替用户接受协议。
+
+### 2026-08-15 终止惩罚回归修复
+
+- 诊断运行 `2026-08-15_00-26-20_wheel_single_stage_h065_085_supportgate`：约 iteration 4020 时末 100 次 mean reward `-80.99`、episode length `15.3/1000`、base contact 终止率 `100%`。
+- `pen_base_contact_termination/keep_balance` 约为 `-200`，确认 `mdp.is_terminated_term` 将持久化的 `_term_dones` 当作当前步信号，导致 reset 后每一步重复扣分；该运行标记为无效且不得 resume。
+- 终止惩罚改用 `mdp.is_terminated` 当前步非 timeout 信号；当前唯一非 timeout 终止项为 `base_contact`。新增环境冒烟断言，禁止再次配置为持久化的 per-term 历史。
+
+## 会话：2026-08-16——稳定性再平衡与高度切换门控
+
+- **状态：** implementation_complete_single_stage_retrain_pending
+- 诊断修复后 20k 运行：`model_6500` 的 base contact/timeout 为 `7.8%/92.2%`，最终 `model_20000` 退化为 `23.4%/76.6%`，二者高度 RMSE 均约 `7.3 cm`。
+- Wheel 高度权重从 `-100` 回调到 `-60`，当前步非 timeout 终止权重从 `-200` 提升到 `-500`，零命令轮目标从 `-0.25` 降到 `-0.10`，死区保持 `0.15 rad/s`。
+- `pen_lin_vel_z` 保持 `-0.3`，但目标差 `≤0.01 m` 时为全量、`≥0.04 m` 时缩放到 `20%`、中间线性过渡。
+- 新增低/中/高高度段的 base contact rate 和 reset fraction 指标，边界为 `0.70/0.80 m`。
+- 新增 `select_wf_checkpoint.py`：在高度/速度/地形门槛内按 100-iteration base contact 均值选择 checkpoint；对上一轮日志正确推荐 `model_6500.pt`，可写部署选择文件供 MuJoCo 优先加载。
+- 纯张量单元测试扩展到 `13/13 PASS`；真实 Isaac Lab Wheel CPU 1-env 冒烟通过，27 个奖励项连续 3 步均为有限值，并确认新权重和竖直速度门控函数已注册。

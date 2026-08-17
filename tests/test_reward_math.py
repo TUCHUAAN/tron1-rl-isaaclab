@@ -32,6 +32,30 @@ class RewardMathTest(unittest.TestCase):
         torch.testing.assert_close(confidence, expected)
         torch.testing.assert_close(reward_math.all_support_confidence(confidence), torch.tensor([0.0, 0.5]))
 
+    def test_mean_support_confidence_is_soft_single_support_gate(self):
+        confidence = torch.tensor([[1.0, 1.0], [1.0, 0.0], [0.25, 0.75], [0.0, 0.0]])
+        gate = reward_math.mean_support_confidence(confidence)
+        torch.testing.assert_close(gate, torch.tensor([1.0, 0.5, 0.5, 0.0]))
+
+    def test_height_command_transition_scale_weakens_then_recovers(self):
+        command = torch.tensor([0.65, 0.65, 0.65, 0.65, 0.65])
+        target = torch.tensor([0.65, 0.66, 0.675, 0.69, 0.75])
+        scale = reward_math.height_command_transition_scale(
+            command,
+            target,
+            min_scale=0.2,
+            full_penalty_gap=0.01,
+            reduced_penalty_gap=0.04,
+        )
+        torch.testing.assert_close(scale, torch.tensor([1.0, 1.0, 0.6, 0.2, 0.2]), atol=2.0e-6, rtol=0.0)
+
+    def test_height_bin_event_statistics_reports_rates_and_coverage(self):
+        height = torch.tensor([0.65, 0.69, 0.72, 0.78, 0.81, 0.85])
+        base_contact = torch.tensor([True, False, True, False, True, True])
+        rates, fractions = reward_math.height_bin_event_statistics(height, base_contact, 0.65, 0.85)
+        torch.testing.assert_close(rates, torch.tensor([0.5, 0.5, 1.0]))
+        torch.testing.assert_close(fractions, torch.tensor([2.0 / 6.0, 2.0 / 6.0, 2.0 / 6.0]))
+
     def test_height_plane_fit_and_invalid_fallback(self):
         coordinates = []
         for x in (-1.0, 0.0, 1.0):
@@ -84,6 +108,40 @@ class RewardMathTest(unittest.TestCase):
         positions[:, 0, 0] = 0.08
         penalty = reward_math.horizontal_neutral_penalty(positions, neutral, tolerance, scale)
         torch.testing.assert_close(penalty, torch.tensor([1.5]))
+
+    def test_wheel_target_symmetry_only_applies_near_zero_yaw(self):
+        targets = torch.tensor([[1.0, 1.0], [1.0, -1.0], [1.0, 2.0]])
+        yaw_commands = torch.tensor([0.0, 0.2, 0.04])
+        penalty = reward_math.wheel_target_symmetry_penalty(
+            targets,
+            yaw_commands,
+            yaw_threshold=0.05,
+            target_difference_tolerance=0.1,
+        )
+        torch.testing.assert_close(penalty, torch.tensor([0.0, 0.0, 0.81]))
+
+    def test_zero_command_wheel_target_penalty_has_dead_zone(self):
+        targets = torch.tensor([[0.10, -0.15], [1.0, -1.0], [1.0, -1.0]])
+        commands = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.2, 0.0, 0.0]])
+        penalty = reward_math.zero_command_wheel_target_penalty(
+            targets,
+            commands,
+            linear_threshold=0.05,
+            angular_threshold=0.05,
+            target_tolerance=0.15,
+        )
+        torch.testing.assert_close(penalty, torch.tensor([0.0, 1.445, 0.0]))
+
+    def test_zero_command_yaw_rate_penalty_is_gated_by_all_commands(self):
+        yaw_rate = torch.tensor([0.3, 0.3, 0.3])
+        commands = torch.tensor([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.0, 0.0, 0.1]])
+        penalty = reward_math.zero_command_yaw_rate_penalty(
+            yaw_rate,
+            commands,
+            linear_threshold=0.05,
+            angular_threshold=0.05,
+        )
+        torch.testing.assert_close(penalty, torch.tensor([0.09, 0.0, 0.0]))
 
     def test_rolling_contact_point_has_zero_slip(self):
         radius = 0.2

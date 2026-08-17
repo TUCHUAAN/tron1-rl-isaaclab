@@ -41,6 +41,90 @@ def all_support_confidence(contact_confidence: torch.Tensor) -> torch.Tensor:
     return torch.amin(contact_confidence, dim=-1)
 
 
+def mean_support_confidence(contact_confidence: torch.Tensor) -> torch.Tensor:
+    """Return a soft support gate averaged over the configured contacts.
+
+    With two supports this evaluates to one for double support, one half for a
+    single confident support, and zero while both supports are airborne.
+    """
+    if contact_confidence.ndim != 2 or contact_confidence.shape[1] == 0:
+        raise ValueError(
+            f"Expected non-empty contact confidence shaped (N, B), got {tuple(contact_confidence.shape)}."
+        )
+    return torch.mean(contact_confidence, dim=-1)
+
+
+def height_command_transition_scale(
+    command: torch.Tensor,
+    target: torch.Tensor,
+    min_scale: float,
+    full_penalty_gap: float,
+    reduced_penalty_gap: float,
+) -> torch.Tensor:
+    """Scale a damping penalty down while a rate-limited height command is moving.
+
+    The scale is one when the current command is within ``full_penalty_gap`` of
+    its sampled target, ``min_scale`` beyond ``reduced_penalty_gap``, and
+    linearly interpolated between the two gaps.
+    """
+    if command.shape != target.shape:
+        raise ValueError(f"Command and target shapes must match, got {command.shape} and {target.shape}.")
+    if not 0.0 <= min_scale <= 1.0:
+        raise ValueError(f"min_scale must be in [0, 1], got {min_scale}.")
+    if full_penalty_gap < 0.0 or reduced_penalty_gap <= full_penalty_gap:
+        raise ValueError(
+            "Require 0 <= full_penalty_gap < reduced_penalty_gap, got "
+            f"{full_penalty_gap} and {reduced_penalty_gap}."
+        )
+
+    gap = torch.abs(target - command)
+    transition = torch.clamp(
+        (gap - full_penalty_gap) / (reduced_penalty_gap - full_penalty_gap),
+        min=0.0,
+        max=1.0,
+    )
+    return 1.0 - (1.0 - min_scale) * transition
+
+
+def height_bin_event_statistics(
+    commanded_height: torch.Tensor,
+    event: torch.Tensor,
+    minimum: float,
+    maximum: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return event rates and sample fractions for low/mid/high height bins.
+
+    The low and high bins each cover one quarter of the configured range; the
+    middle bin covers the remaining half. Empty bins report a zero rate and a
+    zero sample fraction so the companion fraction exposes missing samples.
+    """
+    if commanded_height.ndim != 1 or event.shape != commanded_height.shape:
+        raise ValueError(
+            "Expected one-dimensional height and event tensors with matching shapes, got "
+            f"{commanded_height.shape} and {event.shape}."
+        )
+    if maximum <= minimum:
+        raise ValueError(f"maximum ({maximum}) must be greater than minimum ({minimum}).")
+
+    span = maximum - minimum
+    low_edge = minimum + 0.25 * span
+    high_edge = maximum - 0.25 * span
+    masks = torch.stack(
+        (
+            commanded_height < low_edge,
+            (commanded_height >= low_edge) & (commanded_height <= high_edge),
+            commanded_height > high_edge,
+        ),
+        dim=0,
+    )
+    counts = torch.sum(masks, dim=1)
+    event_f = event.to(commanded_height.dtype)
+    event_counts = torch.sum(masks.to(commanded_height.dtype) * event_f.unsqueeze(0), dim=1)
+    rates = event_counts / torch.clamp(counts.to(commanded_height.dtype), min=1.0)
+    fractions = counts.to(commanded_height.dtype) / max(commanded_height.numel(), 1)
+    return rates, fractions
+
+
 def wheel_clearance_confidence(
     wheel_positions_w: torch.Tensor,
     plane_centroids_w: torch.Tensor,
@@ -100,6 +184,70 @@ def horizontal_neutral_penalty(
         normalized_excess - 0.5,
     )
     return torch.sum(huber, dim=(1, 2))
+
+
+def wheel_target_symmetry_penalty(
+    wheel_targets: torch.Tensor,
+    yaw_commands: torch.Tensor,
+    yaw_threshold: float,
+    target_difference_tolerance: float,
+) -> torch.Tensor:
+    """Penalize unequal left/right wheel targets while the yaw command is near zero."""
+    if wheel_targets.ndim != 2 or wheel_targets.shape[1] != 2:
+        raise ValueError(f"Expected wheel targets shaped (N, 2), got {tuple(wheel_targets.shape)}.")
+    if yaw_commands.shape != wheel_targets.shape[:1]:
+        raise ValueError(f"Expected yaw commands shaped {wheel_targets.shape[:1]}, got {tuple(yaw_commands.shape)}.")
+    if yaw_threshold < 0.0 or target_difference_tolerance < 0.0:
+        raise ValueError("Yaw threshold and wheel-target tolerance must be non-negative.")
+
+    target_difference = torch.abs(wheel_targets[:, 0] - wheel_targets[:, 1])
+    excess = torch.relu(target_difference - target_difference_tolerance)
+    near_zero_yaw = torch.abs(yaw_commands) <= yaw_threshold
+    return torch.square(excess) * near_zero_yaw.to(excess.dtype)
+
+
+def zero_command_wheel_target_penalty(
+    wheel_targets: torch.Tensor,
+    velocity_commands: torch.Tensor,
+    linear_threshold: float,
+    angular_threshold: float,
+    target_tolerance: float,
+) -> torch.Tensor:
+    """Penalize non-zero wheel targets while every planar velocity command is near zero."""
+    if wheel_targets.ndim != 2 or wheel_targets.shape[1] != 2:
+        raise ValueError(f"Expected wheel targets shaped (N, 2), got {tuple(wheel_targets.shape)}.")
+    if velocity_commands.ndim != 2 or velocity_commands.shape != (wheel_targets.shape[0], 3):
+        raise ValueError(
+            f"Expected velocity commands shaped {(wheel_targets.shape[0], 3)}, got {tuple(velocity_commands.shape)}."
+        )
+    if linear_threshold < 0.0 or angular_threshold < 0.0 or target_tolerance < 0.0:
+        raise ValueError("Command thresholds and wheel-target tolerance must be non-negative.")
+
+    zero_linear = torch.linalg.vector_norm(velocity_commands[:, :2], dim=1) <= linear_threshold
+    zero_yaw = torch.abs(velocity_commands[:, 2]) <= angular_threshold
+    excess = torch.relu(torch.abs(wheel_targets) - target_tolerance)
+    return torch.sum(torch.square(excess), dim=1) * (zero_linear & zero_yaw).to(excess.dtype)
+
+
+def zero_command_yaw_rate_penalty(
+    yaw_rate: torch.Tensor,
+    velocity_commands: torch.Tensor,
+    linear_threshold: float,
+    angular_threshold: float,
+) -> torch.Tensor:
+    """Penalize actual yaw rate only while all planar velocity commands are near zero."""
+    if yaw_rate.ndim != 1:
+        raise ValueError(f"Expected yaw rate shaped (N,), got {tuple(yaw_rate.shape)}.")
+    if velocity_commands.ndim != 2 or velocity_commands.shape != (yaw_rate.shape[0], 3):
+        raise ValueError(
+            f"Expected velocity commands shaped {(yaw_rate.shape[0], 3)}, got {tuple(velocity_commands.shape)}."
+        )
+    if linear_threshold < 0.0 or angular_threshold < 0.0:
+        raise ValueError("Command thresholds must be non-negative.")
+
+    zero_linear = torch.linalg.vector_norm(velocity_commands[:, :2], dim=1) <= linear_threshold
+    zero_yaw = torch.abs(velocity_commands[:, 2]) <= angular_threshold
+    return torch.square(yaw_rate) * (zero_linear & zero_yaw).to(yaw_rate.dtype)
 
 
 def fit_height_plane(points_w: torch.Tensor, eps: float = 1.0e-6) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

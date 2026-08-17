@@ -13,6 +13,7 @@ from bipedal_locomotion.tasks.locomotion import mdp
 from bipedal_locomotion.tasks.locomotion.cfg.WF.terrains_cfg import (
     FOOT_ALL_TERRAINS_CFG,
     FOOT_ALL_TERRAINS_PLAY_CFG,
+    WHEEL_HEIGHT_PRETRAIN_TERRAINS_CFG,
     WHEEL_MODE_TERRAINS_CFG,
     WHEEL_MODE_TERRAINS_PLAY_CFG,
 )
@@ -27,11 +28,12 @@ WHEEL_RADIUS = 0.128
 WHEEL_GROUND_CONTACT_SENSORS = ("wheel_L_ground_contact", "wheel_R_ground_contact")
 WHEEL_GROUND_SCAN_SENSORS = ("wheel_L_ground_scan", "wheel_R_ground_scan")
 WHEEL_NEUTRAL_XY = ((0.0, 0.17), (0.0, -0.17))
+BODY_HEIGHT_RANGE = (0.65, 0.85)
 
 
 
 def _configure_wheel_ground_sensors(cfg, *, play: bool):
-    """Add wheel-local ground force and clearance sensors used only by Wheel rewards."""
+    """Add ground-filtered wheel support sensors shared by both experts."""
     ground_mesh_path = "/World/ground/terrain/mesh"
     for side in ("L", "R"):
         setattr(
@@ -61,6 +63,7 @@ def _configure_wheel_ground_sensors(cfg, *, play: bool):
 
 def _configure_common_mode(cfg, *, play: bool):
     """Install the common observation/command schema used by both experts."""
+    _configure_wheel_ground_sensors(cfg, play=play)
     cfg.scene.height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base_Link",
         attach_yaw_only=True,
@@ -85,8 +88,9 @@ def _configure_common_mode(cfg, *, play: bool):
     cfg.commands.body_height = mdp.UniformBodyHeightCommandCfg(
         resampling_time_range=(5.0, 8.0),
         max_rate=0.08,
+        endpoint_fraction=0.20,
         debug_vis=False,
-        ranges=mdp.UniformBodyHeightCommandCfg.Ranges(height=(0.70, 0.85)),
+        ranges=mdp.UniformBodyHeightCommandCfg.Ranges(height=BODY_HEIGHT_RANGE),
     )
     # Keep identical gait inputs for both experts so their checkpoint schemas match.
     cfg.commands.gait_command = mdp.UniformGaitCommandCfg(
@@ -101,7 +105,7 @@ def _configure_common_mode(cfg, *, play: bool):
     )
 
     cfg.observations.commands.body_height_command = ObsTerm(
-        func=mdp.generated_commands, params={"command_name": "body_height"}
+        func=mdp.normalized_body_height_command, params={"command_name": "body_height"}
     )
     cfg.observations.policy.gait_phase = ObsTerm(func=mdp.get_gait_phase)
     cfg.observations.policy.gait_command = ObsTerm(
@@ -116,14 +120,34 @@ def _configure_common_mode(cfg, *, play: bool):
         func=mdp.get_gait_command, params={"command_name": "gait_command"}
     )
 
+    support_params = {
+        "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+        "force_off": 5.0,
+        "force_on": 10.0,
+    }
+    cfg.rewards.stand_still = RewTerm(
+        func=mdp.stand_still_grounded,
+        weight=-5.0,
+        params={"asset_cfg": SceneEntityCfg("robot"), **support_params},
+    )
     cfg.rewards.pen_base_height = RewTerm(
-        func=mdp.body_height_command_l2,
+        func=mdp.body_height_command_grounded_l2,
         weight=-30.0,
         params={
             "command_name": "body_height",
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": SceneEntityCfg("height_scanner"),
+            **support_params,
         },
+    )
+    cfg.rewards.pen_base_contact_termination = RewTerm(
+        # is_terminated_term() reads the manager's persistent per-term history,
+        # so a base-contact flag can remain true after reset and be penalized on
+        # every step of the next episode.  is_terminated() is the current-step,
+        # non-timeout termination signal.  base_contact is currently the only
+        # non-timeout termination in these expert environments.
+        func=mdp.is_terminated,
+        weight=-500.0,
     )
 
     # Start the new experts without stochastic pushes; re-enable after locomotion converges.
@@ -144,14 +168,13 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         _configure_common_mode(self, play=False)
-        _configure_wheel_ground_sensors(self, play=False)
 
         self.scene.terrain.terrain_type = "generator"
         self.scene.terrain.terrain_generator = WHEEL_MODE_TERRAINS_CFG
         self.scene.terrain.max_init_terrain_level = 0
 
-        self.commands.body_height.ranges.height = (0.75, 0.85)
-        self.commands.base_velocity.rel_standing_envs = 0.10
+        self.commands.body_height.ranges.height = BODY_HEIGHT_RANGE
+        self.commands.base_velocity.rel_standing_envs = 0.25
         self.commands.base_velocity.rel_heading_envs = 0.0
         self.commands.base_velocity.ranges.lin_vel_x = (-1.5, 1.5)
         self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
@@ -181,12 +204,15 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
             params={"command_name": "base_velocity", "std": math.sqrt(0.25), **contact_params},
         )
         self.rewards.pen_base_height = RewTerm(
-            func=mdp.body_height_command_plane_l2,
-            weight=-25.0,
+            func=mdp.body_height_command_plane_grounded_l2,
+            weight=-60.0,
             params={
                 "command_name": "body_height",
                 "asset_cfg": SceneEntityCfg("robot"),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
+                "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+                "force_off": 5.0,
+                "force_on": 10.0,
             },
         )
 
@@ -200,6 +226,17 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
         self.rewards.pen_action_rate.weight = -0.10
         self.rewards.pen_action_smoothness.weight = -0.05
         self.rewards.undesired_contacts.weight = -1.0
+        self.rewards.pen_lin_vel_z = RewTerm(
+            func=mdp.lin_vel_z_height_command_gated_l2,
+            weight=-0.3,
+            params={
+                "command_name": "body_height",
+                "min_scale": 0.2,
+                "full_penalty_gap": 0.01,
+                "reduced_penalty_gap": 0.04,
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
         self.rewards.pen_wheel_contact = RewTerm(
             func=mdp.wheel_ground_contact_loss,
             weight=-4.0,
@@ -227,6 +264,40 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
             func=mdp.wheel_rolling_velocity_error,
             weight=-2.0,
             params={"radius": WHEEL_RADIUS, "asset_cfg": SceneEntityCfg("robot", joint_names=WHEEL_JOINTS)},
+        )
+        self.rewards.pen_wheel_target_symmetry = RewTerm(
+            func=mdp.wheel_target_symmetry_l2,
+            weight=-0.5,
+            params={
+                "action_name": "joint_vel",
+                "command_name": "base_velocity",
+                "yaw_threshold": 0.05,
+                "target_difference_tolerance": 0.10,
+            },
+        )
+        self.rewards.pen_zero_command_wheel_target = RewTerm(
+            func=mdp.zero_command_wheel_target_l2,
+            weight=-0.10,
+            params={
+                "action_name": "joint_vel",
+                "command_name": "base_velocity",
+                "linear_threshold": 0.05,
+                "angular_threshold": 0.05,
+                "target_tolerance": 0.15,
+            },
+        )
+        self.rewards.pen_zero_command_yaw_rate = RewTerm(
+            func=mdp.zero_command_yaw_rate_grounded_l2,
+            weight=-2.0,
+            params={
+                "command_name": "base_velocity",
+                "linear_threshold": 0.05,
+                "angular_threshold": 0.05,
+                "asset_cfg": SceneEntityCfg("robot"),
+                "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+                "force_off": 5.0,
+                "force_on": 10.0,
+            },
         )
         self.rewards.pen_terrain_orientation = RewTerm(
             func=mdp.terrain_aligned_orientation_l2,
@@ -279,6 +350,17 @@ class WFWheelModeEnvCfg_PLAY(WFWheelModeEnvCfg):
 
 
 @configclass
+class WFWheelHeightPretrainEnvCfg(WFWheelModeEnvCfg):
+    """Flat-terrain first stage for learning commanded height and zero-command stability."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.scene.terrain.terrain_generator = WHEEL_HEIGHT_PRETRAIN_TERRAINS_CFG
+        self.scene.terrain.max_init_terrain_level = None
+        self.curriculum.terrain_levels = None
+
+
+@configclass
 class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
     """Foot expert: wheel-speed targets are hard-masked to zero on all terrain."""
 
@@ -295,7 +377,7 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
         self.actions.joint_vel.offset = 0.0
         self.actions.joint_vel.use_default_offset = True
 
-        self.commands.body_height.ranges.height = (0.65, 0.82)
+        self.commands.body_height.ranges.height = BODY_HEIGHT_RANGE
         self.commands.body_height.max_rate = 0.06
         self.commands.base_velocity.rel_standing_envs = 0.15
         self.commands.base_velocity.rel_heading_envs = 0.0
