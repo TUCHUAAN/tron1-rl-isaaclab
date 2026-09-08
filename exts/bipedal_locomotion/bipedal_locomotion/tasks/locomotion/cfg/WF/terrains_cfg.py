@@ -185,27 +185,30 @@ WHEEL_MODE_TERRAINS_CFG = TerrainGeneratorCfg(
     seed=42,
     size=(8.0, 8.0),
     border_width=20.0,
-    num_rows=10,
+    # More rows make the 0--0.4 slope and obstacle progression less abrupt.
+    num_rows=12,
     num_cols=16,
     horizontal_scale=0.1,
     vertical_scale=0.005,
     slope_threshold=0.75,
     use_cache=True,
     sub_terrains={
-        "flat": MeshPlaneTerrainCfg(proportion=0.15),
-        "slope_up": HfPyramidSlopedTerrainCfg(
-            proportion=0.175, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+        "flat": MeshPlaneTerrainCfg(proportion=0.20),
+        # Environments spawn on the center platform and move outwards.  The
+        # inverted pyramid therefore represents an actual uphill traversal.
+        "slope_up": HfInvertedPyramidSlopedTerrainCfg(
+            proportion=0.25, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
         ),
-        "slope_down": HfInvertedPyramidSlopedTerrainCfg(
-            proportion=0.175, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
+        "slope_down": HfPyramidSlopedTerrainCfg(
+            proportion=0.15, slope_range=(0.0, 0.4), platform_width=2.0, border_width=0.25
         ),
         "waves": HfWaveTerrainCfg(
-            proportion=0.15, amplitude_range=(0.01, 0.06), num_waves=10, border_width=0.25
+            proportion=0.10, amplitude_range=(0.01, 0.06), num_waves=10, border_width=0.25
         ),
         "random_rough": HfRandomUniformTerrainCfg(
-            proportion=0.15, noise_range=(0.01, 0.06), noise_step=0.01, border_width=0.25
+            proportion=0.10, noise_range=(0.01, 0.06), noise_step=0.01, border_width=0.25
         ),
-        "stairs_up": MeshPyramidStairsTerrainCfg(
+        "stairs_up": MeshInvertedPyramidStairsTerrainCfg(
             proportion=0.10,
             step_height_range=(0.005, 0.04),
             step_width=0.35,
@@ -213,7 +216,7 @@ WHEEL_MODE_TERRAINS_CFG = TerrainGeneratorCfg(
             border_width=1.0,
             holes=False,
         ),
-        "stairs_down": MeshInvertedPyramidStairsTerrainCfg(
+        "stairs_down": MeshPyramidStairsTerrainCfg(
             proportion=0.10,
             step_height_range=(0.03, 0.12),
             step_width=0.35,

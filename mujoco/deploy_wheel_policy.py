@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy the latest TRON1A wheel-mode policy in MuJoCo."""
+"""Deploy a TRON1A wheel or foot expert policy in MuJoCo."""
 
 from __future__ import annotations
 
@@ -26,8 +26,12 @@ DEFAULT_TERRAIN_MANIFEST = Path("/home/tuchuaan/UDMMR/models/terrains/training_t
 DEFAULT_ROBOT_XML = Path(
     "/home/tuchuaan/tron1-mujoco-sim/robot-description/pointfoot/WF_TRON1A/xml/robot.xml"
 )
-DEFAULT_CHECKPOINT_ROOT = REPO_ROOT / "logs" / "rsl_rl" / "wf_tron_1a_wheel_mode"
+DEFAULT_WHEEL_CHECKPOINT_ROOT = REPO_ROOT / "logs" / "rsl_rl" / "wf_tron_1a_wheel_mode"
+DEFAULT_FOOT_CHECKPOINT_ROOT = (
+    REPO_ROOT / "logs" / "rsl_rl" / "wf_tron_1a_foot_all_terrain"
+)
 STABILITY_SELECTION_FILE = "selected_stability_checkpoint.txt"
+CONTROL_MODES = ("wheel", "foot")
 
 PHYSICS_DT = 0.005
 POLICY_DECIMATION = 4
@@ -83,6 +87,48 @@ class TerrainRegion:
     number: int
     path_type: int
     center_xy_w: tuple[float, float]
+
+
+def _fit_height_plane_numpy(
+    points_w: np.ndarray, eps: float = 1.0e-6
+) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Fit the same ``z=a*x+b*y+c`` local terrain plane used in training."""
+    finite = np.isfinite(points_w).all(axis=1)
+    valid_points = points_w[finite]
+    fallback_centroid = np.zeros(3, dtype=np.float64)
+    fallback_normal = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
+    if valid_points.shape[0] < 3:
+        return fallback_centroid, fallback_normal, False
+
+    centroid = valid_points.mean(axis=0)
+    centered = valid_points - centroid
+    x, y, z = centered.T
+    s_xx = float(np.mean(x * x))
+    s_xy = float(np.mean(x * y))
+    s_yy = float(np.mean(y * y))
+    s_xz = float(np.mean(x * z))
+    s_yz = float(np.mean(y * z))
+    determinant = s_xx * s_yy - s_xy * s_xy
+    if not math.isfinite(determinant) or abs(determinant) <= eps:
+        return fallback_centroid, fallback_normal, False
+
+    slope_x = (s_xz * s_yy - s_yz * s_xy) / determinant
+    slope_y = (s_yz * s_xx - s_xz * s_xy) / determinant
+    normal = np.asarray((-slope_x, -slope_y, 1.0), dtype=np.float64)
+    normal_norm = float(np.linalg.norm(normal))
+    if not np.isfinite(normal).all() or normal_norm <= eps:
+        return fallback_centroid, fallback_normal, False
+    return centroid, normal / normal_norm, True
+
+
+def _roll_pitch_degrees(rotation_wb: np.ndarray) -> tuple[float, float]:
+    """Return world-frame ZYX roll and pitch from a body-to-world matrix."""
+    pitch = math.atan2(
+        -float(rotation_wb[2, 0]),
+        math.hypot(float(rotation_wb[0, 0]), float(rotation_wb[1, 0])),
+    )
+    roll = math.atan2(float(rotation_wb[2, 1]), float(rotation_wb[2, 2]))
+    return math.degrees(roll), math.degrees(pitch)
 
 
 def _read_choice(label: str, minimum: int, maximum: int, default: int) -> int:
@@ -322,6 +368,9 @@ class TerrainHeightScanner:
         self.geom_group[0] = 1
         self.ray_direction = np.array((0.0, 0.0, -1.0), dtype=np.float64)
         self.geom_id = np.empty(1, dtype=np.int32)
+        self.last_plane_centroid = np.zeros(3, dtype=np.float64)
+        self.last_plane_normal = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
+        self.last_plane_valid = False
 
     def scan(self, data: mujoco.MjData) -> np.ndarray:
         base_position = np.asarray(data.xpos[self.base_body_id], dtype=np.float64)
@@ -330,6 +379,7 @@ class TerrainHeightScanner:
         cosine = math.cos(yaw)
         sine = math.sin(yaw)
         heights = np.empty(self.offsets.shape[0], dtype=np.float32)
+        terrain_points = np.full((self.offsets.shape[0], 3), np.nan, dtype=np.float64)
         ray_origin = base_position.copy()
         for index, (offset_x, offset_y) in enumerate(self.offsets):
             ray_origin[0] = base_position[0] + cosine * offset_x - sine * offset_y
@@ -344,8 +394,52 @@ class TerrainHeightScanner:
                 -1,
                 self.geom_id,
             )
-            heights[index] = 10.0 if distance < 0.0 else np.clip(distance - 0.5, 0.0, 10.0)
+            if distance < 0.0:
+                heights[index] = 10.0
+            else:
+                heights[index] = np.clip(distance - 0.5, 0.0, 10.0)
+                terrain_points[index] = ray_origin + distance * self.ray_direction
+        (
+            self.last_plane_centroid,
+            self.last_plane_normal,
+            self.last_plane_valid,
+        ) = _fit_height_plane_numpy(terrain_points)
         return heights
+
+    def body_height(self, data: mujoco.MjData) -> float:
+        """Return base distance along the latest fitted local terrain normal."""
+        if not self.last_plane_valid:
+            return math.nan
+        base_position = np.asarray(data.xpos[self.base_body_id], dtype=np.float64)
+        return abs(
+            float(
+                np.dot(
+                    base_position - self.last_plane_centroid,
+                    self.last_plane_normal,
+                )
+            )
+        )
+
+    def attitude_reference(self, data: mujoco.MjData) -> tuple[float, float]:
+        """Return roll/pitch that align base-up with the local terrain normal."""
+        if not self.last_plane_valid:
+            return math.nan, math.nan
+        rotation = np.asarray(data.xmat[self.base_body_id], dtype=np.float64).reshape(3, 3)
+        yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
+        normal = self.last_plane_normal
+        horizontal_heading = np.asarray((math.cos(yaw), math.sin(yaw), 0.0))
+        forward = horizontal_heading - np.dot(horizontal_heading, normal) * normal
+        forward_norm = float(np.linalg.norm(forward))
+        if forward_norm <= 1.0e-6:
+            return math.nan, math.nan
+        forward /= forward_norm
+        left = np.cross(normal, forward)
+        left_norm = float(np.linalg.norm(left))
+        if left_norm <= 1.0e-6:
+            return math.nan, math.nan
+        left /= left_norm
+        reference_rotation = np.column_stack((forward, left, normal))
+        return _roll_pitch_degrees(reference_rotation)
 
 
 def _build_mlp(state_dict: dict[str, torch.Tensor], prefix: str) -> nn.Sequential:
@@ -544,10 +638,31 @@ class WheelPolicy:
 
 
 class TorqueController:
-    """Convert Isaac Lab position/velocity actions to direct MuJoCo torques."""
+    """Convert Isaac Lab actions to MuJoCo torques, with optional low-pass filtering."""
 
-    def __init__(self, model: mujoco.MjModel) -> None:
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        control_mode: str,
+        *,
+        low_pass_enabled: bool = False,
+        cutoff_hz: float = 20.0,
+        control_dt: float = PHYSICS_DT,
+    ) -> None:
+        if control_mode not in CONTROL_MODES:
+            raise ValueError(f"不支持的控制模式：{control_mode}")
+        if cutoff_hz <= 0.0:
+            raise ValueError("力矩低通滤波截止频率必须大于 0 Hz。")
+        if control_dt <= 0.0:
+            raise ValueError("力矩控制周期必须大于 0 s。")
         self.model = model
+        self.control_mode = control_mode
+        self.low_pass_enabled = low_pass_enabled
+        self.cutoff_hz = cutoff_hz
+        self.low_pass_alpha = 1.0 - math.exp(
+            -2.0 * math.pi * cutoff_hz * control_dt
+        )
+        self.filtered_torque = np.zeros(ACTION_DIM, dtype=np.float64)
         self.leg_qpos_addresses = np.asarray(
             [
                 model.jnt_qposadr[
@@ -588,12 +703,36 @@ class TorqueController:
             model.qpos0[self.leg_qpos_addresses], dtype=np.float64
         ).copy()
 
+    def reset(self) -> None:
+        """Reset the filter so torque starts from zero after a robot reset."""
+        self.filtered_torque.fill(0.0)
+
     def apply(self, data: mujoco.MjData, action: np.ndarray) -> float:
         leg_targets = self.default_leg_positions + 0.25 * action[:6]
         leg_torque = 40.0 * (leg_targets - data.qpos[self.leg_qpos_addresses])
         leg_torque -= 2.5 * data.qvel[self.leg_dof_addresses]
-        wheel_torque = 0.8 * (action[6:] - data.qvel[self.wheel_dof_addresses])
-        torque = np.clip(np.concatenate((leg_torque, wheel_torque)), -80.0, 80.0)
+        # In Isaac Lab the Foot expert still emits eight raw actions (and sees
+        # them through last_action), but JointVelocityActionCfg uses scale=0
+        # for both wheels.  Mirror that processed-action behavior here rather
+        # than feeding the unconstrained raw wheel outputs to MuJoCo.
+        wheel_targets = (
+            np.zeros(2, dtype=np.float64)
+            if self.control_mode == "foot"
+            else np.asarray(action[6:], dtype=np.float64)
+        )
+        wheel_torque = 0.8 * (
+            wheel_targets - data.qvel[self.wheel_dof_addresses]
+        )
+        raw_torque = np.clip(
+            np.concatenate((leg_torque, wheel_torque)), -80.0, 80.0
+        )
+        if self.low_pass_enabled:
+            self.filtered_torque += self.low_pass_alpha * (
+                raw_torque - self.filtered_torque
+            )
+            torque = self.filtered_torque
+        else:
+            torque = raw_torque
         data.ctrl.fill(0.0)
         data.ctrl[self.leg_actuator_ids] = torque[:6]
         data.ctrl[self.wheel_actuator_ids] = torque[6:]
@@ -665,6 +804,340 @@ class KeyboardCommandState:
         )
 
 
+class TelemetryPlot:
+    """Lightweight live command tracking and attitude curves in a Tk window."""
+
+    _PLOT_SPECS = (
+        ("vx command vs actual", "vx", "vx_cmd", "m/s", "command", (-1.2, 1.2)),
+        ("vy command vs actual", "vy", "vy_cmd", "m/s", "command", (-0.8, 0.8)),
+        ("wz command vs actual", "wz", "wz_cmd", "rad/s", "command", (-1.2, 1.2)),
+        ("height command vs actual", "height", "height_cmd", "m", "command", None),
+        ("roll vs terrain reference", "roll", "roll_ref", "deg", "terrain ref", (-35.0, 35.0)),
+        ("pitch vs terrain reference", "pitch", "pitch_ref", "deg", "terrain ref", (-35.0, 35.0)),
+    )
+
+    def __init__(
+        self,
+        model: mujoco.MjModel,
+        base_body_id: int,
+        scanner: TerrainHeightScanner,
+        history_seconds: float,
+        body_height_range: tuple[float, float],
+    ) -> None:
+        try:
+            import tkinter as tk
+        except Exception as error:
+            raise RuntimeError(
+                "实时曲线窗口初始化失败；可临时使用 --no-plot 关闭。"
+            ) from error
+
+        self.model = model
+        self.base_body_id = base_body_id
+        self.scanner = scanner
+        self.history_seconds = history_seconds
+        self.velocity_buffer = np.zeros(6, dtype=np.float64)
+        self.times: deque[float] = deque()
+        self.values = {
+            key: deque()
+            for key in (
+                "vx",
+                "vy",
+                "wz",
+                "height",
+                "roll",
+                "pitch",
+                "roll_ref",
+                "pitch_ref",
+                "vx_cmd",
+                "vy_cmd",
+                "wz_cmd",
+                "height_cmd",
+            )
+        }
+        self._tk = tk
+        self._closed = False
+        self.root = tk.Tk()
+        self.root.title("TRON1A command tracking and attitude")
+        self.root.geometry("1050x850+1240+40")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.canvas = tk.Canvas(
+            self.root,
+            background="#0b1020",
+            highlightthickness=0,
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        height_limits = (body_height_range[0] - 0.10, body_height_range[1] + 0.10)
+        self.y_limits = [
+            height_limits if limits is None else limits
+            for *_, limits in self._PLOT_SPECS
+        ]
+        self.plot_bounds: list[tuple[float, float, float, float]] = []
+        self.line_items: list[tuple[int, int]] = []
+        self._last_canvas_size = (0, 0)
+        self.root.update_idletasks()
+        self._layout()
+        self.root.update()
+
+    def _on_close(self) -> None:
+        self._closed = True
+        try:
+            self.root.destroy()
+        except self._tk.TclError:
+            pass
+
+    def _layout(self) -> None:
+        width = max(int(self.canvas.winfo_width()), 800)
+        height = max(int(self.canvas.winfo_height()), 650)
+        self._last_canvas_size = (width, height)
+        self.canvas.delete("all")
+        self.plot_bounds.clear()
+        self.line_items.clear()
+        gap = 12.0
+        panel_width = (width - 3.0 * gap) / 2.0
+        panel_height = (height - 4.0 * gap) / 3.0
+        for index, spec in enumerate(self._PLOT_SPECS):
+            title, _, _, unit, reference_label, _ = spec
+            column = index % 2
+            row = index // 2
+            panel_x0 = gap + column * (panel_width + gap)
+            panel_y0 = gap + row * (panel_height + gap)
+            panel_x1 = panel_x0 + panel_width
+            panel_y1 = panel_y0 + panel_height
+            self.canvas.create_rectangle(
+                panel_x0,
+                panel_y0,
+                panel_x1,
+                panel_y1,
+                fill="#111827",
+                outline="#334155",
+            )
+            self.canvas.create_text(
+                0.5 * (panel_x0 + panel_x1),
+                panel_y0 + 16.0,
+                text=title,
+                fill="#f8fafc",
+                font=("TkDefaultFont", 10, "bold"),
+            )
+            x0 = panel_x0 + 58.0
+            y0 = panel_y0 + 36.0
+            x1 = panel_x1 - 16.0
+            y1 = panel_y1 - 34.0
+            self.plot_bounds.append((x0, y0, x1, y1))
+            lower, upper = self.y_limits[index]
+            for fraction in (0.0, 0.5, 1.0):
+                y = y1 - fraction * (y1 - y0)
+                self.canvas.create_line(x0, y, x1, y, fill="#263247")
+                value = lower + fraction * (upper - lower)
+                self.canvas.create_text(
+                    x0 - 7.0,
+                    y,
+                    text=f"{value:.2f}",
+                    anchor="e",
+                    fill="#94a3b8",
+                    font=("TkDefaultFont", 8),
+                )
+            self.canvas.create_rectangle(x0, y0, x1, y1, outline="#64748b")
+            self.canvas.create_text(
+                panel_x0 + 14.0,
+                0.5 * (y0 + y1),
+                text=unit,
+                angle=90,
+                fill="#cbd5e1",
+                font=("TkDefaultFont", 8),
+            )
+            for fraction, label in (
+                (0.0, f"-{self.history_seconds:g}"),
+                (0.5, f"-{0.5 * self.history_seconds:g}"),
+                (1.0, "0"),
+            ):
+                x = x0 + fraction * (x1 - x0)
+                self.canvas.create_text(
+                    x,
+                    y1 + 13.0,
+                    text=label,
+                    fill="#94a3b8",
+                    font=("TkDefaultFont", 8),
+                )
+            legend_y = panel_y1 - 12.0
+            self.canvas.create_line(
+                panel_x0 + 75.0,
+                legend_y,
+                panel_x0 + 97.0,
+                legend_y,
+                fill="#38bdf8",
+                width=2,
+            )
+            self.canvas.create_text(
+                panel_x0 + 102.0,
+                legend_y,
+                text="actual",
+                anchor="w",
+                fill="#cbd5e1",
+                font=("TkDefaultFont", 8),
+            )
+            self.canvas.create_line(
+                panel_x0 + 160.0,
+                legend_y,
+                panel_x0 + 182.0,
+                legend_y,
+                fill="#fb923c",
+                width=2,
+                dash=(5, 3),
+            )
+            self.canvas.create_text(
+                panel_x0 + 187.0,
+                legend_y,
+                text=reference_label,
+                anchor="w",
+                fill="#cbd5e1",
+                font=("TkDefaultFont", 8),
+            )
+            actual_item = self.canvas.create_line(
+                0.0, 0.0, 0.0, 0.0, fill="#38bdf8", width=2
+            )
+            reference_item = self.canvas.create_line(
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                fill="#fb923c",
+                width=2,
+                dash=(5, 3),
+            )
+            self.line_items.append((actual_item, reference_item))
+
+    @property
+    def is_open(self) -> bool:
+        if self._closed:
+            return False
+        try:
+            return bool(self.root.winfo_exists())
+        except self._tk.TclError:
+            self._closed = True
+            return False
+
+    def reset(self) -> None:
+        if not self.is_open:
+            return
+        self.times.clear()
+        for series in self.values.values():
+            series.clear()
+        for actual_item, reference_item in self.line_items:
+            self.canvas.coords(actual_item, 0.0, 0.0, 0.0, 0.0)
+            self.canvas.coords(reference_item, 0.0, 0.0, 0.0, 0.0)
+
+    def sample(
+        self, data: mujoco.MjData, command: np.ndarray, simulation_time: float
+    ) -> None:
+        if not self.is_open:
+            self._closed = True
+            return
+        if self.times and simulation_time < self.times[-1]:
+            self.reset()
+
+        mujoco.mj_objectVelocity(
+            self.model,
+            data,
+            mujoco.mjtObj.mjOBJ_BODY,
+            self.base_body_id,
+            self.velocity_buffer,
+            1,
+        )
+        rotation = np.asarray(
+            data.xmat[self.base_body_id], dtype=np.float64
+        ).reshape(3, 3)
+        roll, pitch = _roll_pitch_degrees(rotation)
+        roll_ref, pitch_ref = self.scanner.attitude_reference(data)
+        sample = {
+            "vx": float(self.velocity_buffer[3]),
+            "vy": float(self.velocity_buffer[4]),
+            "wz": float(self.velocity_buffer[2]),
+            "height": self.scanner.body_height(data),
+            "roll": roll,
+            "pitch": pitch,
+            "roll_ref": roll_ref,
+            "pitch_ref": pitch_ref,
+            "vx_cmd": float(command[0]),
+            "vy_cmd": float(command[1]),
+            "wz_cmd": float(command[2]),
+            "height_cmd": float(command[3]),
+        }
+        self.times.append(simulation_time)
+        for key, value in sample.items():
+            self.values[key].append(value)
+
+        while self.times and simulation_time - self.times[0] > self.history_seconds:
+            self.times.popleft()
+            for series in self.values.values():
+                series.popleft()
+
+    def draw(self) -> None:
+        if not self.is_open or not self.times:
+            return
+        try:
+            self.root.update_idletasks()
+        except self._tk.TclError:
+            self._closed = True
+            return
+        canvas_size = (int(self.canvas.winfo_width()), int(self.canvas.winfo_height()))
+        relative_times = np.asarray(self.times, dtype=np.float64) - self.times[-1]
+        limits_changed = False
+        plot_values = []
+        for index, (_, actual_key, reference_key, _, _, _) in enumerate(self._PLOT_SPECS):
+            actual_values = np.asarray(self.values[actual_key], dtype=np.float64)
+            reference_values = np.asarray(self.values[reference_key], dtype=np.float64)
+            plot_values.append((actual_values, reference_values))
+            finite_values = np.concatenate(
+                (actual_values[np.isfinite(actual_values)], reference_values[np.isfinite(reference_values)])
+            )
+            if finite_values.size:
+                lower, upper = self.y_limits[index]
+                data_min = float(np.min(finite_values))
+                data_max = float(np.max(finite_values))
+                if data_min < lower or data_max > upper:
+                    margin = max(0.05 * (data_max - data_min), 1.0e-3)
+                    self.y_limits[index] = (
+                        min(lower, data_min - margin),
+                        max(upper, data_max + margin),
+                    )
+                    limits_changed = True
+        if limits_changed or canvas_size != self._last_canvas_size:
+            self._layout()
+
+        for index, ((actual_values, reference_values), bounds, items) in enumerate(
+            zip(plot_values, self.plot_bounds, self.line_items)
+        ):
+            lower, upper = self.y_limits[index]
+            x0, y0, x1, y1 = bounds
+            time_fraction = np.clip(
+                (relative_times + self.history_seconds) / self.history_seconds,
+                0.0,
+                1.0,
+            )
+            x_coordinates = x0 + time_fraction * (x1 - x0)
+            for values, item in zip((actual_values, reference_values), items):
+                finite = np.isfinite(values)
+                if not np.any(finite):
+                    self.canvas.coords(item, 0.0, 0.0, 0.0, 0.0)
+                    continue
+                y_fraction = np.clip((values[finite] - lower) / (upper - lower), 0.0, 1.0)
+                y_coordinates = y1 - y_fraction * (y1 - y0)
+                coordinates = np.column_stack(
+                    (x_coordinates[finite], y_coordinates)
+                ).ravel()
+                if coordinates.size == 2:
+                    coordinates = np.tile(coordinates, 2)
+                self.canvas.coords(item, *coordinates.tolist())
+        try:
+            self.root.update()
+        except self._tk.TclError:
+            self._closed = True
+
+    def close(self) -> None:
+        if self.is_open:
+            self._on_close()
+
+
 def reset_robot(
     model: mujoco.MjModel,
     data: mujoco.MjData,
@@ -687,9 +1160,13 @@ def reset_robot(
 
 
 def _print_help(
-    checkpoint: Path, region: TerrainRegion, spawn_xy: np.ndarray, yaw: float
+    checkpoint: Path,
+    control_mode: str,
+    region: TerrainRegion,
+    spawn_xy: np.ndarray,
+    yaw: float,
 ) -> None:
-    print(f"[policy] checkpoint={checkpoint}")
+    print(f"[policy] mode={control_mode}, checkpoint={checkpoint}")
     print(
         f"[terrain] type={region.terrain_type}, level={region.terrain_level}, "
         f"number={region.number}, center={region.center_xy_w}"
@@ -699,7 +1176,10 @@ def _print_help(
         f"yaw={yaw:+.3f} rad"
     )
     print("  W/S : 前进/后退")
-    print("  Q/E : 左移/右移（该轮式策略训练时横向指令为 0，效果可能不稳定）")
+    if control_mode == "wheel":
+        print("  Q/E : 左移/右移（Wheel 训练时横向指令为 0，效果可能不稳定）")
+    else:
+        print("  Q/E : 左移/右移")
     print("  Z/C : 升高/降低机身")
     print("  A/D : 左转/右转")
     print("  Space : 清除运动指令")
@@ -767,10 +1247,16 @@ def _render(
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Deploy the latest Isaac Lab TRON1A wheel-mode policy in MuJoCo."
+        description="Deploy an Isaac Lab TRON1A wheel or foot expert in MuJoCo."
     )
+    parser.add_argument("--mode", choices=CONTROL_MODES, default="wheel")
     parser.add_argument("--checkpoint", type=Path, default=None)
-    parser.add_argument("--checkpoint-root", type=Path, default=DEFAULT_CHECKPOINT_ROOT)
+    parser.add_argument(
+        "--checkpoint-root",
+        type=Path,
+        default=None,
+        help="Checkpoint search root; defaults to the selected mode's log directory.",
+    )
     parser.add_argument("--terrain-xml", type=Path, default=DEFAULT_TERRAIN_XML)
     parser.add_argument("--terrain-manifest", type=Path, default=DEFAULT_TERRAIN_MANIFEST)
     parser.add_argument("--robot-xml", type=Path, default=DEFAULT_ROBOT_XML)
@@ -790,9 +1276,26 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--swing-height", type=float, default=0.14)
     parser.add_argument("--spawn-z-offset", type=float, default=0.1)
     parser.add_argument("--render-hz", type=float, default=60.0)
+    parser.add_argument("--plot-hz", type=float, default=5.0)
+    parser.add_argument("--plot-sample-hz", type=float, default=20.0)
+    parser.add_argument("--plot-history", type=float, default=20.0)
     parser.add_argument("--camera-distance", type=float, default=3.5)
     parser.add_argument("--camera-elevation", type=float, default=-18.0)
+    parser.add_argument(
+        "--torque-low-pass",
+        action="store_true",
+        help="Enable a first-order low-pass filter on all eight applied joint torques.",
+    )
+    parser.add_argument(
+        "--torque-cutoff-hz",
+        type=float,
+        default=20.0,
+        help="Torque low-pass cutoff frequency in Hz (default: 20; filter is off unless enabled).",
+    )
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument(
+        "--no-plot", action="store_true", help="Disable the live telemetry window."
+    )
     parser.add_argument("--no-realtime", action="store_true")
     parser.add_argument(
         "--max-steps", type=int, default=None, help="Optional number of physics steps."
@@ -800,6 +1303,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.render_hz <= 0.0:
         parser.error("--render-hz 必须大于 0。")
+    if args.plot_hz <= 0.0:
+        parser.error("--plot-hz 必须大于 0。")
+    if args.plot_sample_hz <= 0.0:
+        parser.error("--plot-sample-hz 必须大于 0。")
+    if args.plot_history <= 0.0:
+        parser.error("--plot-history 必须大于 0。")
+    if args.torque_cutoff_hz <= 0.0:
+        parser.error("--torque-cutoff-hz 必须大于 0。")
     if args.max_steps is not None and args.max_steps <= 0:
         parser.error("--max-steps 必须大于 0。")
     if args.terrain_type is None and (
@@ -831,11 +1342,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     regions = load_terrain_regions(args.terrain_manifest.expanduser().resolve())
     region = _select_region_from_args(args, regions)
-    checkpoint = (
-        args.checkpoint.expanduser().resolve()
-        if args.checkpoint is not None
-        else discover_latest_checkpoint(args.checkpoint_root.expanduser().resolve())
-    )
+    if args.checkpoint is not None:
+        checkpoint = args.checkpoint.expanduser().resolve()
+    else:
+        checkpoint_root = (
+            args.checkpoint_root
+            if args.checkpoint_root is not None
+            else (
+                DEFAULT_FOOT_CHECKPOINT_ROOT
+                if args.mode == "foot"
+                else DEFAULT_WHEEL_CHECKPOINT_ROOT
+            )
+        )
+        checkpoint = discover_latest_checkpoint(checkpoint_root.expanduser().resolve())
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint 不存在：{checkpoint}")
     body_height_range = checkpoint_body_height_range(checkpoint)
@@ -855,7 +1374,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     base_body_id = _model_id(model, mujoco.mjtObj.mjOBJ_BODY, "base_Link")
     scanner = TerrainHeightScanner(model, base_body_id)
     policy = WheelPolicy(checkpoint, device, model, scanner, body_height_range)
-    torque_controller = TorqueController(model)
+    torque_controller = TorqueController(
+        model,
+        args.mode,
+        low_pass_enabled=args.torque_low_pass,
+        cutoff_hz=args.torque_cutoff_hz,
+    )
     rng = np.random.default_rng(args.seed)
     gait_command = np.asarray(
         (
@@ -871,10 +1395,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         model, data, region, rng, args.spawn_z_offset
     )
     policy.reset(data, gait_command)
-    _print_help(checkpoint, region, spawn_xy, spawn_yaw)
+    torque_controller.reset()
+    _print_help(checkpoint, args.mode, region, spawn_xy, spawn_yaw)
     print(
-        f"[runtime] checkpoint_iter={policy.iteration}, device={device}, "
+        f"[runtime] mode={args.mode}, checkpoint_iter={policy.iteration}, "
+        f"wheel_target={'locked_zero' if args.mode == 'foot' else 'policy'}, "
+        f"device={device}, "
         f"physics_dt={PHYSICS_DT}, policy_dt={POLICY_DT}, "
+        f"torque_low_pass={'on' if args.torque_low_pass else 'off'}, "
+        f"torque_cutoff_hz={args.torque_cutoff_hz:g}, "
         f"height_range={body_height_range}"
     )
 
@@ -883,12 +1412,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     option = None
     scene = None
     context = None
+    telemetry_plot = None
     reset_requested = False
     if not args.headless:
         if not glfw.init():
             raise RuntimeError("GLFW 初始化失败；无显示环境可使用 --headless。")
         window = glfw.create_window(
-            1200, 900, "TRON1A MuJoCo Wheel Policy", None, None
+            1200, 900, f"TRON1A MuJoCo {args.mode.title()} Policy", None, None
         )
         if window is None:
             glfw.terminate()
@@ -906,6 +1436,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         camera.type = mujoco.mjtCamera.mjCAMERA_FREE
         camera.distance = args.camera_distance
         camera.elevation = args.camera_elevation
+        if not args.no_plot:
+            telemetry_plot = TelemetryPlot(
+                model,
+                base_body_id,
+                scanner,
+                args.plot_history,
+                body_height_range,
+            )
+            glfw.focus_window(window)
 
         def key_callback(
             callback_window: glfw._GLFWwindow,
@@ -939,6 +1478,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = np.asarray((0.0, 0.0, 0.0, args.body_height), dtype=np.float32)
     torque_norm = 0.0
     next_render_time = float(data.time)
+    next_plot_sample_time = float(data.time)
+    next_plot_draw_time = float(data.time)
     next_status_time = float(data.time)
     wall_start = time.perf_counter()
     sim_start = float(data.time)
@@ -957,11 +1498,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                     model, data, region, rng, args.spawn_z_offset
                 )
                 policy.reset(data, gait_command)
+                torque_controller.reset()
                 action.fill(0.0)
                 episode_physics_steps = 0
                 reset_requested = False
                 next_render_time = float(data.time)
+                next_plot_sample_time = float(data.time)
+                next_plot_draw_time = float(data.time)
                 next_status_time = float(data.time)
+                if telemetry_plot is not None:
+                    telemetry_plot.reset()
                 wall_start = time.perf_counter()
                 sim_start = float(data.time)
                 print(
@@ -990,6 +1536,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"h={command[3]:.3f}) torque_norm={torque_norm:.2f}"
                 )
                 next_status_time += 1.0
+
+            if (
+                telemetry_plot is not None
+                and data.time + 1.0e-12 >= next_plot_sample_time
+            ):
+                telemetry_plot.sample(data, command, float(data.time))
+                while next_plot_sample_time <= data.time + 1.0e-12:
+                    next_plot_sample_time += 1.0 / args.plot_sample_hz
+
+            if (
+                telemetry_plot is not None
+                and data.time + 1.0e-12 >= next_plot_draw_time
+            ):
+                telemetry_plot.draw()
+                while next_plot_draw_time <= data.time + 1.0e-12:
+                    next_plot_draw_time += 1.0 / args.plot_hz
 
             if window is not None and data.time + 1.0e-12 >= next_render_time:
                 assert camera is not None
@@ -1020,6 +1582,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     time.sleep(sleep_time)
     finally:
         command_state.clear_motion()
+        if telemetry_plot is not None:
+            telemetry_plot.close()
         if context is not None:
             context.free()
         if window is not None:

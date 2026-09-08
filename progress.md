@@ -215,3 +215,68 @@
 - 新增低/中/高高度段的 base contact rate 和 reset fraction 指标，边界为 `0.70/0.80 m`。
 - 新增 `select_wf_checkpoint.py`：在高度/速度/地形门槛内按 100-iteration base contact 均值选择 checkpoint；对上一轮日志正确推荐 `model_6500.pt`，可写部署选择文件供 MuJoCo 优先加载。
 - 纯张量单元测试扩展到 `13/13 PASS`；真实 Isaac Lab Wheel CPU 1-env 冒烟通过，27 个奖励项连续 3 步均为有限值，并确认新权重和竖直速度门控函数已注册。
+
+## 会话：2026-08-17——Foot 局部地形姿态跟踪
+
+- **状态：** implementation_complete_foot_retrain_pending
+- Foot 专家关闭世界水平 `pen_flat_orientation_l2=-12.0`，改为 `pen_terrain_orientation=-8.0`。
+- 新姿态项使用 `height_scanner` 拟合局部地形法向，并惩罚 base-up 与该法向的偏差；Wheel/Foot 现在使用相同的局部地形姿态语义。
+- 冒烟测试新增统一断言：两个专家均不得保留世界水平项，且必须注册 `terrain_aligned_orientation_l2`、权重 `-8.0`。
+- 真实 Isaac Lab Foot CPU 1-env / 3-step 冒烟通过，25 个奖励项均为有限值；纯张量单元测试 `13/13 PASS`。
+
+### 2026-08-18 MuJoCo Foot 单专家部署
+
+- MuJoCo 部署器新增 `--mode foot`，未显式给 checkpoint 时自动搜索 `wf_tron_1a_foot_all_terrain` 日志目录。
+- Foot 保留 Actor 原始 8 维输出作为 `last_action`，但执行器层将左右轮速度目标硬锁为 `0 rad/s`，与训练环境的 `scale=0` 行为一致；Wheel 默认行为不变。
+- 最新 Foot `model_20000.pt` 已通过 MuJoCo CPU 无窗口 200 步冒烟，自动选择路径和 `wheel_target=locked_zero` 均正确；默认 Wheel 入口另通过 20 步回归。
+
+### 2026-08-29 MuJoCo 实时命令跟踪窗口
+
+- 可视化部署新增独立轻量 Tk Canvas 实时窗口，分别绘制 `vx/vy/wz` 命令与机身系实际值、高度命令与局部地形平面相对实际高度，以及 roll/pitch（度）与地形法向参考。
+- 曲线默认显示最近 `20 s`，以 `20 Hz` 采样、`5 Hz` 增量刷新；新增 `--plot-history`、`--plot-sample-hz`、`--plot-hz` 和 `--no-plot`，headless 模式不创建曲线窗口。
+- 高度复用策略的 121 点扫描命中点拟合局部平面，与训练指标定义保持一致；roll/pitch 参考保持当前航向并令 base-up 对齐拟合地形法向。
+- 数值测试、Wheel CPU 无窗口 200 步回归和双 GUI 测试均通过；10 秒仿真量的非实时基准从 Matplotlib 版 `18.30 s` 降到 Tk 版 `12.24 s`，接近无曲线窗口的 `11.89 s`。
+
+### 2026-08-29 Wheel 高度指数塑形与跟踪权重调整
+
+- Wheel 保持局部平面高度 L2 惩罚 `pen_base_height=-60.0`，新增 `rew_base_height_exp=+1.0`、`std=0.05 m` 的高斯核/RBF 高度跟踪奖励；平面无效或无轮地支撑时不产生正奖励。
+- Wheel 的 `rew_lin_vel_xy/rew_ang_vel_z` 调为 `+3.5/+1.25`，`pen_terrain_orientation` 调为 `-10.0`；Foot 对应权重保持不变。
+- Wheel 的 `pen_action_rate/pen_action_smoothness` 调为 `-0.15/-0.08`。
+- 已补纯张量单元测试与真实环境冒烟断言；纯张量测试 `16/16 PASS`，静态编译和 `git diff --check` 通过。真实 Isaac Lab 冒烟启动被 NVIDIA EULA 交互提示阻止，未代替用户接受协议；下一轮训练必须从头开始。
+
+### 2026-08-30 Wheel 速度跟踪核收紧
+
+- `rew_lin_vel_xy` 保持 `+3.5`，`std²` 从 `0.20` 收紧到 `0.12`。
+- `rew_ang_vel_z` 从 `+1.25` 调到 `+1.5`，`std²` 从 `0.25` 收紧到 `0.12`。
+- `stand_still` 从 `-6.0` 调到 `-7.0`；Foot 配置不变。
+- 冒烟断言同步检查两项速度奖励的权重和 `std²`，防止后续配置回退。
+- 纯张量测试 `19/19 PASS`，相关 Python 静态编译及 `git diff --check` 通过。
+
+### 2026-08-31 Wheel `C_any` 门控与训练诊断
+
+- Wheel `rew_lin_vel_xy/rew_ang_vel_z` 由左右轮联合接地置信度的最小值门控改为最大值门控；`stand_still` 由左右轮地形过滤力置信度均值改为最大值。
+- 新增 `WheelSupportVelocityCommand`，通过 `Metrics/base_velocity/` 记录左右轮力/几何/联合置信度、`C_all/C_any`、双轮/单轮/无支撑比例及 XY/Yaw 门控前后跟踪值；不修改 policy/critic 输入。
+- 奖励权重、跟踪核宽和观测维度保持不变。已同步当前奖励表、WF/PF 对比和训练文档。
+- 验证：纯张量单测 `19/19 PASS`；真实 Isaac Lab CPU 1-env / 3-step Wheel 冒烟通过，26 个奖励项有限，诊断 reset 上报正常；policy/critic 观测维度仍为 `155/348`。
+
+### 2026-08-31 Wheel 地形课程改进
+
+- 修正 Pyramid/InvertedPyramid 相对中心出发时的实际上下坡/楼梯方向；真正上楼梯改为 `0.005～0.04 m`，下楼梯为 `0.03～0.12 m`。
+- Wheel 地形等级从 `10` 增至 `12`，平地/上坡/下坡/波浪/粗糙/上楼梯/下楼梯比例为 `20/25/15/10/10/10/10%`。
+- 用 `wheel_terrain_levels_vel_tracking` 替代只看距离的默认课程：升级需位移 `>4 m`、移动命令占比 `>=0.25`、XY 跟踪 `>=0.55`、`C_any>=0.75` 且未倒地；倒地或移动期跟踪 `<0.25` 降一级。
+- 纯张量测试增至 `21/21 PASS`；真实 Isaac Lab CPU 1-env / 3-step Wheel 冒烟通过，26 个奖励项有限，policy/critic 维度仍为 `155/348`。
+
+### 2026-09-01 Wheel 命令覆盖与实际速度加速度弱约束
+
+- Wheel 速度命令改为互斥四类：站立/直行/纯转向/混合占 `25/20/20/35%`，`vy=0`；补足原独立连续采样几乎没有严格纯 `wz` 的覆盖缺口。
+- 新增 `pen_base_lin_acc_xy=-0.05` 和 `pen_base_yaw_acc=-0.05`：50 Hz 实际 base 速度差分、`3.0 m/s²` 与 `4.0 rad/s²` 饱和尺度、`std=0.30` 近目标跟踪门控、力与几何联合 `C_any`；reset 后前两步为零。
+- TensorBoard 增加四类命令比例及两个新增奖励；Foot、网络 schema、既有 Wheel 权重和地形课程参数不变。下一轮 Wheel 必须从头训练，run name 使用 `wheel_modebalanced_accel_v2`。
+- 验证：纯张量/课程测试 `23/23 PASS`；真实 Isaac Sim CPU 1-env / 3-step Wheel 冒烟通过，28 个奖励项全部有限，命令互斥、配置权重和加速度奖励启动屏蔽断言均通过；policy/critic 维度仍为 `155/348`。
+
+### 2026-09-02 Wheel 14k 后坡面退化分析与修订
+
+- 分析 `wheel_modebalanced_accel_v2`：9.5k→17.5k 的 XY 误差 `0.228→0.297`，Yaw 误差 `0.225→0.200`；`pen_base_lin_acc_xy` 始终约 `-0.0046～-0.0051`，不支持其在 14k 后突然变大的假设。
+- 命令比例由站立/直行/纯转向/混合 `25/20/20/35%` 改为 `25/30/10/35%`，平移覆盖从 `55%` 恢复到 `65%`。
+- `pen_base_lin_acc_xy` 从 `-0.05` 降为 `-0.02`；`pen_base_yaw_acc` 从 `-0.05` 降为 `-0.02`，并由饱和有界核改为 `sqrt(1+alpha_z²/4²)-1` Charbonnier 核。
+- 新增直行、纯转向、混合条件误差和纯转向 `wz` 加速度 RMS，均按条件样本数归一化，不进入网络输入或地形课程。
+- 验证：纯张量/课程测试 `24/24 PASS`；真实 Isaac Sim CPU 1-env / 3-step Wheel 冒烟通过，28 个奖励项有限，policy/critic 维度仍为 `155/348`。

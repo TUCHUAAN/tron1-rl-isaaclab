@@ -3,8 +3,10 @@
 import math
 
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveGaussianNoiseCfg as GaussianNoise
@@ -23,7 +25,7 @@ from .limx_wheelfoot_env_cfg import WFBaseEnvCfg, WFBaseEnvCfg_PLAY
 
 WHEEL_LINKS = "wheel_[LR]_Link"
 WHEEL_BODY_NAMES = ["wheel_L_Link", "wheel_R_Link"]
-WHEEL_JOINTS = "wheel_[LR]_Joint"
+WHEEL_JOINTS = ["wheel_L_Joint", "wheel_R_Joint"]
 WHEEL_RADIUS = 0.128
 WHEEL_GROUND_CONTACT_SENSORS = ("wheel_L_ground_contact", "wheel_R_ground_contact")
 WHEEL_GROUND_SCAN_SENSORS = ("wheel_L_ground_scan", "wheel_R_ground_scan")
@@ -143,9 +145,9 @@ def _configure_common_mode(cfg, *, play: bool):
     cfg.rewards.pen_base_contact_termination = RewTerm(
         # is_terminated_term() reads the manager's persistent per-term history,
         # so a base-contact flag can remain true after reset and be penalized on
-        # every step of the next episode.  is_terminated() is the current-step,
-        # non-timeout termination signal.  base_contact is currently the only
-        # non-timeout termination in these expert environments.
+        # every step of the next episode. is_terminated() is the current-step,
+        # non-timeout termination signal. Wheel currently has base_contact;
+        # Foot additionally installs sustained_knee_contact below.
         func=mdp.is_terminated,
         weight=-500.0,
     )
@@ -168,10 +170,23 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         _configure_common_mode(self, play=False)
+        self.rewards.stand_still.weight = -7.0
 
         self.scene.terrain.terrain_type = "generator"
         self.scene.terrain.terrain_generator = WHEEL_MODE_TERRAINS_CFG
         self.scene.terrain.max_init_terrain_level = 0
+        self.curriculum.terrain_levels = CurrTerm(
+            func=mdp.wheel_terrain_levels_vel_tracking,
+            params={
+                "command_name": "base_velocity",
+                "asset_name": "robot",
+                "distance_fraction_up": 0.5,
+                "moving_rate_threshold": 0.25,
+                "tracking_up": 0.55,
+                "tracking_down": 0.25,
+                "support_up": 0.75,
+            },
+        )
 
         self.commands.body_height.ranges.height = BODY_HEIGHT_RANGE
         self.commands.base_velocity.rel_standing_envs = 0.25
@@ -181,8 +196,9 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
 
-        # Wheel locomotion reward: both wheels must have filtered ground force
-        # and wheel-center clearance consistent with the wheel radius.
+        # Wheel locomotion rewards use filtered ground force and wheel-center
+        # clearance consistent with the wheel radius. Tracking-related terms
+        # are fully active when either wheel has valid support (C_any).
         contact_params = {
             "asset_cfg": SceneEntityCfg("robot", body_names=WHEEL_BODY_NAMES),
             "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
@@ -194,14 +210,38 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
             "geometry_tolerance_off": 0.035,
         }
         self.rewards.rew_lin_vel_xy = RewTerm(
-            func=mdp.track_lin_vel_xy_exp_all_wheels_ground,
-            weight=3.0,
-            params={"command_name": "base_velocity", "std": math.sqrt(0.2), **contact_params},
+            func=mdp.track_lin_vel_xy_exp_any_wheel_ground,
+            weight=3.5,
+            params={"command_name": "base_velocity", "std": math.sqrt(0.12), **contact_params},
         )
         self.rewards.rew_ang_vel_z = RewTerm(
-            func=mdp.track_ang_vel_z_exp_all_wheels_ground,
-            weight=1.0,
-            params={"command_name": "base_velocity", "std": math.sqrt(0.25), **contact_params},
+            func=mdp.track_ang_vel_z_exp_any_wheel_ground,
+            weight=1.5,
+            params={"command_name": "base_velocity", "std": math.sqrt(0.12), **contact_params},
+        )
+        self.rewards.pen_base_lin_acc_xy = RewTerm(
+            func=mdp.BaseVelocityAccelerationPenalty,
+            weight=-0.02,
+            params={
+                "command_name": "base_velocity",
+                "component": "xy",
+                "tracking_std": 0.30,
+                "acceleration_scale": 3.0,
+                "kernel": "bounded",
+                **contact_params,
+            },
+        )
+        self.rewards.pen_base_yaw_acc = RewTerm(
+            func=mdp.BaseVelocityAccelerationPenalty,
+            weight=-0.02,
+            params={
+                "command_name": "base_velocity",
+                "component": "yaw",
+                "tracking_std": 0.30,
+                "acceleration_scale": 4.0,
+                "kernel": "charbonnier",
+                **contact_params,
+            },
         )
         self.rewards.pen_base_height = RewTerm(
             func=mdp.body_height_command_plane_grounded_l2,
@@ -215,6 +255,19 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
                 "force_on": 10.0,
             },
         )
+        self.rewards.rew_base_height_exp = RewTerm(
+            func=mdp.body_height_command_plane_grounded_exp,
+            weight=1.0,
+            params={
+                "command_name": "body_height",
+                "asset_cfg": SceneEntityCfg("robot"),
+                "sensor_cfg": SceneEntityCfg("height_scanner"),
+                "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+                "std": 0.05,
+                "force_off": 5.0,
+                "force_on": 10.0,
+            },
+        )
 
         # Replace the previous x/z symmetry, wheel-spacing and relative-velocity
         # terms with one direct horizontal neutral-position penalty.
@@ -223,8 +276,8 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
         self.rewards.pen_joint_vel_wheel_l2 = None
         self.rewards.pen_flat_orientation_l2 = None
         self.rewards.pen_vel_non_wheel_l2.weight = -0.08
-        self.rewards.pen_action_rate.weight = -0.10
-        self.rewards.pen_action_smoothness.weight = -0.05
+        self.rewards.pen_action_rate.weight = -0.15
+        self.rewards.pen_action_smoothness.weight = -0.08
         self.rewards.undesired_contacts.weight = -1.0
         self.rewards.pen_lin_vel_z = RewTerm(
             func=mdp.lin_vel_z_height_command_gated_l2,
@@ -252,18 +305,18 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
                 "scale_xy": (0.02, 0.02),
             },
         )
-        self.rewards.pen_wheel_air_time = RewTerm(
-            func=mdp.wheel_air_time_l2,
-            weight=-8.0,
-            params={
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=WHEEL_LINKS),
-                "max_air_time": 1.0,
-            },
-        )
         self.rewards.pen_rolling_error = RewTerm(
             func=mdp.wheel_rolling_velocity_error,
             weight=-2.0,
-            params={"radius": WHEEL_RADIUS, "asset_cfg": SceneEntityCfg("robot", joint_names=WHEEL_JOINTS)},
+            params={
+                "radius": WHEEL_RADIUS,
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    joint_names=WHEEL_JOINTS,
+                    body_names=WHEEL_BODY_NAMES,
+                    preserve_order=True,
+                ),
+            },
         )
         self.rewards.pen_wheel_target_symmetry = RewTerm(
             func=mdp.wheel_target_symmetry_l2,
@@ -286,22 +339,9 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
                 "target_tolerance": 0.15,
             },
         )
-        self.rewards.pen_zero_command_yaw_rate = RewTerm(
-            func=mdp.zero_command_yaw_rate_grounded_l2,
-            weight=-2.0,
-            params={
-                "command_name": "base_velocity",
-                "linear_threshold": 0.05,
-                "angular_threshold": 0.05,
-                "asset_cfg": SceneEntityCfg("robot"),
-                "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
-                "force_off": 5.0,
-                "force_on": 10.0,
-            },
-        )
         self.rewards.pen_terrain_orientation = RewTerm(
             func=mdp.terrain_aligned_orientation_l2,
-            weight=-8.0,
+            weight=-10.0,
             params={"sensor_cfg": SceneEntityCfg("height_scanner")},
         )
         self.rewards.pen_wheel_landing_impact = RewTerm(
@@ -324,6 +364,36 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
                 "force_off": 5.0,
                 "force_on": 10.0,
             },
+        )
+
+        # Explicitly sample standing, straight, yaw-only and mixed commands,
+        # while logging support-gate, tracking and command-mode diagnostics.
+        velocity_cfg = self.commands.base_velocity
+        self.commands.base_velocity = mdp.WheelSupportVelocityCommandCfg(
+            asset_name=velocity_cfg.asset_name,
+            heading_command=velocity_cfg.heading_command,
+            heading_control_stiffness=velocity_cfg.heading_control_stiffness,
+            rel_standing_envs=velocity_cfg.rel_standing_envs,
+            rel_heading_envs=velocity_cfg.rel_heading_envs,
+            ranges=velocity_cfg.ranges,
+            resampling_time_range=velocity_cfg.resampling_time_range,
+            debug_vis=velocity_cfg.debug_vis,
+            goal_vel_visualizer_cfg=velocity_cfg.goal_vel_visualizer_cfg,
+            current_vel_visualizer_cfg=velocity_cfg.current_vel_visualizer_cfg,
+            contact_sensor_names=WHEEL_GROUND_CONTACT_SENSORS,
+            terrain_sensor_names=WHEEL_GROUND_SCAN_SENSORS,
+            wheel_body_names=tuple(WHEEL_BODY_NAMES),
+            wheel_radius=WHEEL_RADIUS,
+            force_off=contact_params["force_off"],
+            force_on=contact_params["force_on"],
+            geometry_tolerance_on=contact_params["geometry_tolerance_on"],
+            geometry_tolerance_off=contact_params["geometry_tolerance_off"],
+            support_threshold=0.5,
+            tracking_std=math.sqrt(0.12),
+            moving_command_threshold=0.1,
+            rel_straight_envs=0.30,
+            rel_yaw_only_envs=0.10,
+            rel_mixed_envs=0.35,
         )
 
 
@@ -385,10 +455,80 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_y = (-0.4, 0.4)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.8, 0.8)
         self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
+        # Preserve the shared four-dimensional checkpoint schema, but remove
+        # the unused target-height signal now that swing clearance is learned
+        # from terrain observations instead of explicitly commanded.
+        self.commands.gait_command.ranges.durations = (0.5, 0.5)
+        self.commands.gait_command.ranges.swing_height = (0.0, 0.0)
+
+        # Follow the PF-style locomotion regularization while retaining the
+        # wheel-specific zero-speed and terrain-aware gait constraints.
+        self.rewards.stand_still = None
+        self.rewards.pen_joint_torque.weight = -8.0e-5
+        self.rewards.pen_joint_accel.weight = -2.5e-7
+        self.rewards.pen_action_rate.weight = -0.03
+        self.rewards.pen_action_smoothness.weight = -0.04
+        self.rewards.pen_joint_power_l1.weight = -5.0e-4
+        self.rewards.pen_vel_non_wheel_l2.weight = -1.0e-3
+
+        # Use the same local-plane height definition and any-wheel support gate
+        # as Wheel Expert, while retaining Foot's existing L2 weight.
+        height_params = {
+            "command_name": "body_height",
+            "asset_cfg": SceneEntityCfg("robot"),
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+            "force_off": 5.0,
+            "force_on": 10.0,
+        }
+        self.rewards.pen_base_height = RewTerm(
+            func=mdp.body_height_command_plane_grounded_l2,
+            weight=-30.0,
+            params=height_params,
+        )
+        self.rewards.rew_base_height_exp = RewTerm(
+            func=mdp.body_height_command_plane_grounded_exp,
+            weight=1.0,
+            params={**height_params, "std": 0.05},
+        )
 
         self.rewards.rew_same_foot_x_position = None
+        # Match PF: prevent the support ends from becoming too close without
+        # constraining their fore-aft separation during a normal step.
+        self.rewards.pen_feet_distance.params["min_feet_distance"] = 0.115
+        self.rewards.pen_feet_distance.params["max_feet_distance"] = 1.0
+        # Foot locomotion should follow the local support slope instead of
+        # being pulled toward a world-horizontal base orientation.
+        self.rewards.pen_flat_orientation_l2 = None
+        self.rewards.pen_terrain_orientation = RewTerm(
+            func=mdp.terrain_aligned_orientation_l2,
+            weight=-10.0,
+            params={"sensor_cfg": SceneEntityCfg("height_scanner")},
+        )
         self.rewards.pen_joint_vel_wheel_l2.weight = -0.10
         self.rewards.undesired_contacts.weight = -1.0
+        self.rewards.pen_knee_contact_force = RewTerm(
+            func=mdp.undesired_contact_force_l2,
+            weight=-2.0,
+            params={
+                "sensor_cfg": SceneEntityCfg(
+                    "contact_forces", body_names=["knee_L_Link", "knee_R_Link"]
+                ),
+                "force_threshold": 10.0,
+                "force_scale": 100.0,
+                "max_normalized_excess": 3.0,
+            },
+        )
+        self.terminations.sustained_knee_contact = DoneTerm(
+            func=mdp.SustainedIllegalContact,
+            params={
+                "sensor_cfg": SceneEntityCfg(
+                    "contact_forces", body_names=["knee_L_Link", "knee_R_Link"]
+                ),
+                "force_threshold": 20.0,
+                "duration_s": 0.08,
+            },
+        )
         self.rewards.gait_contact_schedule = RewTerm(
             func=mdp.GaitReward,
             weight=1.0,
@@ -403,15 +543,18 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
                 "asset_cfg": SceneEntityCfg("robot", body_names=WHEEL_LINKS),
             },
         )
-        self.rewards.pen_swing_height = RewTerm(
-            func=mdp.wheel_swing_height_tracking,
-            weight=-4.0,
+        self.rewards.pen_feet_regulation = RewTerm(
+            func=mdp.wheel_terrain_feet_regulation,
+            weight=-0.1,
             params={
-                "command_name": "gait_command",
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=WHEEL_LINKS),
-                "asset_cfg": SceneEntityCfg("robot", body_names=WHEEL_LINKS),
-                "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    body_names=WHEEL_BODY_NAMES,
+                    preserve_order=True,
+                ),
+                "terrain_sensor_names": WHEEL_GROUND_SCAN_SENSORS,
                 "wheel_radius": WHEEL_RADIUS,
+                "height_scale": 0.65,
             },
         )
         self.rewards.pen_all_wheels_air_time = RewTerm(
@@ -422,13 +565,20 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
                 "max_air_time": 1.0,
             },
         )
-        self.rewards.pen_wheel_landing_impact = RewTerm(
-            func=mdp.wheel_landing_impact_l2,
-            weight=-0.02,
+        self.rewards.foot_landing_vel = RewTerm(
+            func=mdp.wheel_terrain_landing_velocity_l2,
+            weight=-0.5,
             params={
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=WHEEL_LINKS),
-                "force_threshold": 100.0,
-                "force_scale": 100.0,
+                "asset_cfg": SceneEntityCfg(
+                    "robot",
+                    body_names=WHEEL_BODY_NAMES,
+                    preserve_order=True,
+                ),
+                "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+                "terrain_sensor_names": WHEEL_GROUND_SCAN_SENSORS,
+                "wheel_radius": WHEEL_RADIUS,
+                "about_landing_threshold": 0.08,
+                "contact_force_threshold": 0.1,
             },
         )
         self.rewards.pen_wheel_stance_slip = RewTerm(

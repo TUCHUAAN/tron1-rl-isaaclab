@@ -1,10 +1,10 @@
 # 当前双专家方案与原有 WF 及 PF 网络输入对比
 
-> 对比时间：2026-08-12。
+> 对比时间：2026-09-04。
 >
 > 原有方案指 `Isaac-Limx-WF-Blind-Flat-v0` 和 `Isaac-Limx-PF-Blind-Flat-v0`；当前方案指 `Isaac-Limx-WF-Wheel-Mode-v0` 和 `Isaac-Limx-WF-Foot-AllTerrain-v0`。
 >
-> 本文以当前工作树中的最终生效配置为准，重点说明 Actor、历史编码器、Commands 和 Critic 的输入维度、数据来源及拼接方式。
+> 本文以当前工作树中的最终生效配置为准，重点说明 Actor、历史编码器、Commands 和 Critic 的输入维度、数据来源及拼接方式。原有 PF 的维度同时使用已训练的 `model_2000.pt` 权重形状复核。
 
 ## 1. 总体输入链路
 
@@ -33,13 +33,13 @@ critic_input = concat(critic_obs, commands)
 
 | 项目 | 原有 WF | 原有 PF | 当前 Wheel | 当前 Foot |
 |---|---:|---:|---:|---:|
-| 当前 `policy_obs` | `28` | `34` | `155` | `155` |
-| `obsHistory` 单帧 | `28` | `34` | `34` | `34` |
+| 当前 `policy_obs` | `28` | `30` | `155` | `155` |
+| `obsHistory` 单帧 | `28` | `30` | `34` | `34` |
 | 历史帧数 | `10` | `10` | `10` | `10` |
-| Encoder 输入 | `280` | `340` | `340` | `340` |
+| Encoder 输入 | `280` | `300` | `340` | `340` |
 | Encoder 输出 latent | `3` | `3` | `3` | `3` |
 | `commands` | `3` | `3` | `4` | `4` |
-| Actor 总输入 | `34` | `40` | `162` | `162` |
+| Actor 总输入 | `34` | `36` | `162` | `162` |
 | Actor 输出 | `8` | `6` | `8` | `8` |
 | Actor / Critic 隐藏层 | `[512, 256, 128]` | 相同 | 相同 | 相同 |
 | Encoder 隐藏层 | `[256, 128]` | 相同 | 相同 | 相同 |
@@ -61,19 +61,19 @@ critic_input = concat(critic_obs, commands)
 
 原有 WF Blind-Flat 关闭高度扫描，也没有 gait phase/gait command，因此是纯本体感知输入。
 
-### 3.2 原有 PF：34 维
+### 3.2 原有 PF：30 维
 
 | `policy_obs` 切片 | 维度 | 内容 |
 |---|---:|---|
 | `[0:3]` | 3 | base 角速度 |
 | `[3:6]` | 3 | base 坐标系投影重力 |
-| `[6:14]` | 8 | PF 模型全部关节相对位置 |
-| `[14:22]` | 8 | PF 模型全部关节速度 |
-| `[22:28]` | 6 | 上一次腿关节动作 |
-| `[28:30]` | 2 | gait phase：`sin(phase), cos(phase)` |
-| `[30:34]` | 4 | gait command：频率、相位差、接触持续比例、摆动高度 |
+| `[6:12]` | 6 | PF 的 6 个可动腿关节相对位置 |
+| `[12:18]` | 6 | PF 的 6 个可动腿关节速度 |
+| `[18:24]` | 6 | 上一次腿关节动作 |
+| `[24:26]` | 2 | gait phase：`sin(phase), cos(phase)` |
+| `[26:30]` | 4 | gait command：频率、相位差、接触持续比例、摆动高度 |
 
-PF 模型中有 8 个关节状态，但策略只控制 6 个腿关节，因此 `joint_pos/joint_vel` 是 8 维，`last_action` 和 Actor 输出是 6 维。
+PF URDF 中左右足端关节是 fixed joint，不会出现在 Isaac Lab articulation 的关节状态里。因此 PF 的 `joint_pos`、`joint_vel`、`last_action` 和 Actor 输出均为 6 维。这个结论也与 `model_2000.pt` 中 Encoder `300 → 3`、Actor `36 → 6` 的权重形状一致。
 
 ### 3.3 当前 Wheel / Foot：155 维
 
@@ -106,8 +106,8 @@ Wheel 并不使用 gait reward，但仍保留 gait 输入，目的是与 Foot ch
 |  | `[3:31]` | 28D `policy_obs` |
 |  | `[31:34]` | 3D 速度命令 |
 | 原有 PF | `[0:3]` | 3D history latent |
-|  | `[3:37]` | 34D `policy_obs` |
-|  | `[37:40]` | 3D 速度命令 |
+|  | `[3:33]` | 30D `policy_obs` |
+|  | `[33:36]` | 3D 速度命令 |
 | Wheel / Foot | `[0:3]` | 3D history latent |
 |  | `[3:158]` | 155D `policy_obs` |
 |  | `[158:162]` | 3D 速度 + 1D 机身高度命令 |
@@ -143,7 +143,7 @@ relative_position = current_joint_position - default_joint_position
 | 任务 | 取值范围 |
 |---|---|
 | 原有 WF / Wheel / Foot | 只取 6 个非轮腿关节，排除 `wheel_L/R_Joint` |
-| 原有 PF | 取 PF 模型全部 8 个关节 |
+| 原有 PF | 取 PF 模型的 6 个可动腿关节；左右足端 fixed joint 不进入 articulation 状态 |
 
 Wheel/Foot 排除轮关节位置的原因是轮关节可连续旋转，绝对角度不是稳定的姿态特征；轮速度仍保留。
 
@@ -194,7 +194,10 @@ Gait command 由 `GaitCommand` 在命令管理器中采样：
 | 任务 | 重采样时间 | 频率 | 相位差 | 接触持续比例 | 摆动高度 |
 |---|---:|---:|---:|---:|---:|
 | 原有 PF | `5 s` | `1.5～2.5 Hz` | `0.5` | `0.5` | `0.10～0.20 m` |
-| Wheel / Foot | `5～8 s` | `1.2～2.2 Hz` | `0.5` | `0.45～0.60` | `0.08～0.20 m` |
+| Wheel | `5～8 s` | `1.2～2.2 Hz` | `0.5` | `0.45～0.60` | `0.08～0.20 m`（奖励未读取） |
+| Foot | `5～8 s` | `1.2～2.2 Hz` | `0.5` | 固定 `0.5` | 固定 `0.0`，不作为目标 |
+
+Foot 保留第四维只是为了不改变当前 4 维 gait schema；其摆动高度由 121 维地形扫描、步态接触、近地切向运动、落地速度和能耗约束共同决定。
 
 ### 5.8 高度扫描
 
@@ -226,13 +229,15 @@ velocity_commands = command_manager.get_command("base_velocity")
                    = [vx, vy, wz]
 ```
 
+Wheel 的这 3 维输入形状没有变化，但命令生成方式为互斥四类：`25%` 全零站立、`30%` 仅 `vx`、`10%` 仅 `wz`、`35%` 同时采样 `vx/wz`，且 `vy` 恒为零。四类采样标签只用于命令生成和 TensorBoard 诊断，不作为额外网络输入；Actor 只看到最终的 `[vx,0,wz]`。
+
 当前 Wheel/Foot 还增加：
 
 ```text
 body_height_command = command_manager.get_command("body_height")
 ```
 
-当前工作树中 Wheel 和 Foot 共用 `0.62～0.85 m` 的高度目标范围，但它始终只占 Actor 输入的 1 维。
+当前工作树中 Wheel 和 Foot 共用 `0.65～0.85 m` 的高度目标范围，但它始终只占 Actor 输入的 1 维。
 
 ## 6. 观测后处理和噪声
 
@@ -263,10 +268,10 @@ ObservationManager 对每一项的处理顺序为：
 | 任务 | 历史单帧内容 | 单帧维度 |
 |---|---|---:|
 | 原有 WF | 角速度、投影重力、6D 腿位置、8D 关节速度、8D last action | `28` |
-| 原有 PF | 角速度、投影重力、8D 位置、8D 速度、6D last action、2D phase、4D gait | `34` |
+| 原有 PF | 角速度、投影重力、6D 位置、6D 速度、6D last action、2D phase、4D gait | `30` |
 | Wheel / Foot | 原有 WF 的 28D + 2D phase + 4D gait | `34` |
 
-`obsHistory` 保留最近 10 个 policy samples。在 50 Hz 策略频率下，它相当于约 `0.2 s` 的 10 帧窗口。Runner 将 `(num_envs, 10, frame_dim)` 展平为 280 或 340 维。
+`obsHistory` 保留最近 10 个 policy samples。在 50 Hz 策略频率下，它相当于约 `0.2 s` 的 10 帧窗口。Runner 将 `(num_envs, 10, frame_dim)` 展平：原有 WF 为 280 维、原有 PF 为 300 维，当前 Wheel/Foot 为 340 维。
 
 当前 Wheel/Foot 的 121 维高度扫描不写入历史。否则 10 帧高度扫描单独就需要 1210 维；当前设计只让 Actor 看当前地形，历史编码器专注于机器人动力学状态。
 
@@ -274,7 +279,7 @@ ObservationManager 对每一项的处理顺序为：
 
 ```text
 原有 WF: 280 → 256 → 128 → 3
-原有 PF: 340 → 256 → 128 → 3
+原有 PF: 300 → 256 → 128 → 3
 Wheel / Foot: 340 → 256 → 128 → 3
 activation: ELU
 ```
@@ -382,7 +387,7 @@ Wheel 的“双轮有效接地”不是一个直接喂给 Actor 的 bool。Actor
 ## 11. 关键结论
 
 1. **原有 WF 是最简单的 blind 输入。** 28D 当前本体观测 + 280D 历史 + 3D 速度命令。
-2. **PF 在 blind 本体感知上加入 gait。** 它与当前 Foot 共享 340D 历史尺寸，但当前帧、commands 和 action 尺寸不同。
+2. **PF 在 blind 本体感知上加入 gait。** 它使用 30D 当前帧和 300D 历史；当前 Foot 因保留 8D WF 动作/状态 schema，使用 34D 历史单帧和 340D 历史。
 3. **当前双专家的主要增量是 121D 当前地形扫描。** 它不进入 history，所以 Encoder 仍为 340D 输入。
 4. **3D latent 有明确物理意义。** 它被单独训练为最近 10 帧观测对 base 线速度的估计。
 5. **Wheel 和 Foot 的网络输入完全一致。** 两者的差异主要在地形分布、奖励、命令范围和 Foot 轮动作 mask，不在网络 schema。

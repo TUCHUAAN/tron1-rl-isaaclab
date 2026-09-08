@@ -1,3 +1,4 @@
 from .body_height_command import BodyHeightCommand
-from .commands_cfg import UniformBodyHeightCommandCfg, UniformGaitCommandCfg
+from .commands_cfg import UniformBodyHeightCommandCfg, UniformGaitCommandCfg, WheelSupportVelocityCommandCfg
 from .gait_command import GaitCommand
+from .wheel_support_velocity_command import WheelSupportVelocityCommand
