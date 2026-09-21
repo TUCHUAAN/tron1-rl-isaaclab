@@ -40,6 +40,19 @@ def main() -> None:
 
     env.reset()
     print("[SMOKE] Environment reset.", flush=True)
+    if is_wheel_task or is_foot_task:
+        groups = unwrapped.observation_manager.compute(update_history=False)
+        assert groups["policy"].shape[-1] == 161, groups["policy"].shape
+        assert groups["obsHistory"].flatten(start_dim=1).shape[-1] == 340
+        assert unwrapped.observation_manager.active_terms["policy"][-1] == "zero_command_hold"
+        hold = unwrapped.reward_manager.get_term_cfg("pen_zero_command_hold").func
+        age = hold.tracker.age.clone()
+        groups_again = unwrapped.observation_manager.compute(update_history=False)
+        torch.testing.assert_close(hold.tracker.age, age)
+        torch.testing.assert_close(groups_again["policy"][:, -6:], groups_again["critic"][:, -6:])
+        assert torch.isfinite(groups_again["policy"][:, -6:]).all()
+        assert (groups_again["policy"][:, -3:] == 0).all()
+
     action = torch.zeros_like(unwrapped.action_manager.action)
     acceleration_startup_values = {
         name: [] for name in ("pen_base_lin_acc_xy", "pen_base_yaw_acc")
@@ -96,6 +109,67 @@ def main() -> None:
             f"{sorted(unexpected_non_timeout_terms)}"
         )
     if is_foot_task:
+        velocity_term = unwrapped.command_manager.get_term("base_velocity")
+        if velocity_term.__class__.__name__ != "FootVelocityCommand":
+            raise AssertionError("Foot must use its five-mode velocity sampler.")
+        fractions = tuple(getattr(velocity_term.cfg, name) for name in (
+            "rel_standing_envs", "rel_straight_envs", "rel_lateral_envs", "rel_yaw_only_envs", "rel_mixed_envs"
+        ))
+        if fractions != (0.15, 0.25, 0.10, 0.20, 0.30):
+            raise AssertionError(f"Unexpected Foot mode fractions: {fractions}")
+        gait_term = unwrapped.command_manager.get_term("gait_command")
+        if not gait_term.cfg.continuous_phase:
+            raise AssertionError("Foot gait must use continuous phase.")
+        phase_before = gait_term.phase.clone()
+        gait_term._resample_command(torch.arange(unwrapped.num_envs, device=unwrapped.device))
+        torch.testing.assert_close(gait_term.phase, phase_before)
+        diagnostics = velocity_term.diagnostic_means()
+        if not all(math.isfinite(value) for value in diagnostics.values()):
+            raise AssertionError(f"Non-finite Foot diagnostics: {diagnostics}")
+        if sum(diagnostics[f"{mode}/samples"] for mode in velocity_term.MODE_NAMES) <= 0:
+            raise AssertionError("Foot diagnostics did not record any executed steps.")
+        wheel_action = unwrapped.action_manager.get_term("joint_vel")
+        if wheel_action.__class__.__name__ != "WheelVelocityPIAction":
+            raise AssertionError(
+                f"Foot task is not using PI wheel-speed control: {wheel_action.__class__.__name__}"
+            )
+        expected_pi_cfg = {
+            "kp": 2.0,
+            "kp_scale_range": (0.25, 2.0),
+            "ki_ratio_range": (0.0, 0.25),
+            "effort_limit": 80.0,
+        }
+        for name, expected in expected_pi_cfg.items():
+            actual = getattr(wheel_action.cfg, name)
+            if actual != expected:
+                raise AssertionError(f"Unexpected Foot PI setting {name}: {actual}, expected {expected}")
+        if wheel_action.cfg.clip != {"wheel_.*": (0.0, 0.0)} or not wheel_action.cfg.fixed_zero_target:
+            raise AssertionError(f"Unexpected Foot wheel-target clip: {wheel_action.cfg.clip}")
+        wheel_action.process_actions(
+            torch.tensor([[2.0, -2.0]], device=unwrapped.device, dtype=wheel_action.raw_actions.dtype)
+        )
+        torch.testing.assert_close(
+            wheel_action.processed_actions,
+            torch.tensor([[0.0, 0.0]], device=unwrapped.device, dtype=wheel_action.raw_actions.dtype),
+        )
+        wheel_action.process_actions(torch.zeros_like(wheel_action.raw_actions))
+        if not torch.all((wheel_action.kp >= 0.5) & (wheel_action.kp <= 4.0)):
+            raise AssertionError(f"Foot Kp samples are outside [0.5, 4.0]: {wheel_action.kp}")
+        ki_ratio = wheel_action.ki / wheel_action.kp
+        if not torch.all((ki_ratio >= 0.0) & (ki_ratio <= 0.25)):
+            raise AssertionError(f"Foot Ki/Kp samples are outside [0, 0.25]: {ki_ratio}")
+        wheel_actuator = unwrapped.scene["robot"].actuators["wheels"]
+        if not torch.all(wheel_actuator.stiffness == 0.0) or not torch.all(wheel_actuator.damping == 0.0):
+            raise AssertionError(
+                "Foot implicit wheel gains must be zero under explicit PI control: "
+                f"stiffness={wheel_actuator.stiffness}, damping={wheel_actuator.damping}"
+            )
+        for event_name in ("robot_joint_stiffness_and_damping", "randomize_actuator_gains"):
+            event_cfg = getattr(unwrapped.cfg.events, event_name)
+            randomized_joints = set(event_cfg.params["asset_cfg"].joint_names)
+            if randomized_joints & {"wheel_L_Joint", "wheel_R_Joint"}:
+                raise AssertionError(f"{event_name} still randomizes implicit Foot wheel gains.")
+
         if "pen_knee_contact_force" not in active_rewards:
             raise AssertionError("Foot task is missing the force-sensitive knee-contact penalty.")
         knee_reward_cfg = unwrapped.reward_manager.get_term_cfg("pen_knee_contact_force")
@@ -143,6 +217,42 @@ def main() -> None:
         )
 
     if is_wheel_task:
+        wheel_action = unwrapped.action_manager.get_term("joint_vel")
+        if wheel_action.__class__.__name__ != "WheelVelocityPIAction":
+            raise AssertionError(f"Wheel task is not using PI velocity control: {wheel_action.__class__.__name__}")
+        expected_pi_cfg = {
+            "kp": 2.0,
+            "kp_scale_range": (0.25, 2.0),
+            "ki_ratio_range": (0.0, 0.25),
+            "effort_limit": 80.0,
+        }
+        for name, expected in expected_pi_cfg.items():
+            actual = getattr(wheel_action.cfg, name)
+            if actual != expected:
+                raise AssertionError(f"Unexpected Wheel PI setting {name}: {actual}, expected {expected}")
+        if not torch.all((wheel_action.kp >= 0.5) & (wheel_action.kp <= 4.0)):
+            raise AssertionError(f"Wheel Kp samples are outside [0.5, 4.0]: {wheel_action.kp}")
+        ki_ratio = wheel_action.ki / wheel_action.kp
+        if not torch.all((ki_ratio >= 0.0) & (ki_ratio <= 0.25)):
+            raise AssertionError(f"Wheel Ki/Kp samples are outside [0, 0.25]: {ki_ratio}")
+        if not torch.all(wheel_action.kp[:, 0] == wheel_action.kp[:, 1]):
+            raise AssertionError(f"Left/right Wheel Kp samples must match: {wheel_action.kp}")
+        if not torch.all(wheel_action.ki[:, 0] == wheel_action.ki[:, 1]):
+            raise AssertionError(f"Left/right Wheel Ki samples must match: {wheel_action.ki}")
+        if not torch.isfinite(wheel_action.integral_error).all():
+            raise AssertionError("Wheel PI integral contains non-finite values.")
+        wheel_actuator = unwrapped.scene["robot"].actuators["wheels"]
+        if not torch.all(wheel_actuator.stiffness == 0.0) or not torch.all(wheel_actuator.damping == 0.0):
+            raise AssertionError(
+                "Wheel implicit gains must be zero when explicit PI control is active: "
+                f"stiffness={wheel_actuator.stiffness}, damping={wheel_actuator.damping}"
+            )
+        for event_name in ("robot_joint_stiffness_and_damping", "randomize_actuator_gains"):
+            event_cfg = getattr(unwrapped.cfg.events, event_name)
+            randomized_joints = set(event_cfg.params["asset_cfg"].joint_names)
+            if randomized_joints & {"wheel_L_Joint", "wheel_R_Joint"}:
+                raise AssertionError(f"{event_name} still randomizes implicit Wheel gains.")
+
         stand_cfg = unwrapped.reward_manager.get_term_cfg("stand_still")
         if stand_cfg.func.__name__ != "stand_still_grounded":
             raise AssertionError(f"Stand-still penalty is not support-gated: {stand_cfg.func.__name__}")
@@ -336,8 +446,8 @@ def main() -> None:
                 f"weight={yaw_tracking_cfg.weight}, std={yaw_tracking_cfg.params['std']}"
             )
         acceleration_terms = {
-            "pen_base_lin_acc_xy": ("xy", 3.0, -0.02, "bounded"),
-            "pen_base_yaw_acc": ("yaw", 4.0, -0.02, "charbonnier"),
+            "pen_base_lin_acc_xy": ("xy", 3.0, 0.0, "bounded"),
+            "pen_base_yaw_acc": ("yaw", 4.0, -0.025, "charbonnier"),
         }
         for name, (component, scale, weight, kernel) in acceleration_terms.items():
             acceleration_cfg = unwrapped.reward_manager.get_term_cfg(name)
@@ -353,8 +463,12 @@ def main() -> None:
                 raise AssertionError(f"Unexpected acceleration tracking std for {name}.")
             if acceleration_cfg.params["kernel"] != kernel:
                 raise AssertionError(f"Unexpected acceleration kernel for {name}: {acceleration_cfg.params['kernel']}")
-            if not torch.all(acceleration_cfg.func._steps_since_reset == 3):
-                raise AssertionError(f"Unexpected acceleration history length for {name}.")
+            expected_steps = 0 if weight == 0.0 else 3
+            if not torch.all(acceleration_cfg.func._steps_since_reset == expected_steps):
+                raise AssertionError(
+                    f"Unexpected acceleration history length for {name}: "
+                    f"{acceleration_cfg.func._steps_since_reset}, expected {expected_steps}."
+                )
         if unwrapped.reward_manager.get_term_cfg("pen_action_rate").weight != -0.15:
             raise AssertionError("Unexpected Wheel action-rate penalty weight.")
         if unwrapped.reward_manager.get_term_cfg("pen_action_smoothness").weight != -0.08:
@@ -396,6 +510,14 @@ def main() -> None:
         if "stand_still" in active_rewards:
             raise AssertionError("Foot must not retain the WF stand-still penalty.")
         expected_foot_weights = {
+            "rew_lin_vel_xy": 5.5,
+            "rew_ang_vel_z": 3.0,
+            "pen_yaw_tracking_error": -1.0,
+            "pen_lin_vel_xy_tracking_error": -0.5,
+            "pen_base_lin_acc_xy": 0.0,
+            "pen_base_yaw_acc": 0.0,
+            **{f"pen_cycle_mean_{c}": (-1.0 if c in ("vx", "vy", "yaw") else -0.1)
+               for c in ("vx", "vy", "yaw", "height", "roll", "pitch")},
             "rew_leg_symmetry": 0.5,
             "pen_joint_torque": -8.0e-5,
             "pen_joint_accel": -2.5e-7,
@@ -403,20 +525,62 @@ def main() -> None:
             "pen_action_smoothness": -0.04,
             "pen_joint_power_l1": -5.0e-4,
             "pen_vel_non_wheel_l2": -1.0e-3,
-            "pen_joint_vel_wheel_l2": -0.10,
+            "pen_wheel_actual_speed": 0.0,
             "pen_terrain_orientation": -10.0,
             "pen_base_height": -30.0,
-            "rew_base_height_exp": 1.0,
+            "rew_base_height_exp": 1.5,
             "gait_contact_schedule": 1.0,
+            "pen_feet_distance": -1.0,
+            "rew_swing_clearance": 2.0,
+            "pen_planned_support_contact": -1.0,
+            "pen_foothold_region": -0.2,
+            "pen_missed_swing": -0.2,
+            "pen_swing_min_clearance": -1.0,
+            "pen_zero_command_hold": -0.5,
             "pen_feet_regulation": -0.1,
             "foot_landing_vel": -0.5,
         }
         for name, expected_weight in expected_foot_weights.items():
-            actual_weight = unwrapped.reward_manager.get_term_cfg(name).weight
+            actual_weight = getattr(unwrapped.cfg.rewards, name).weight
             if actual_weight != expected_weight:
                 raise AssertionError(
                     f"Unexpected Foot reward weight for {name}: {actual_weight}, expected {expected_weight}"
                 )
+        for component, scale in (("vx", .2), ("vy", .2), ("yaw", .3),
+                                 ("height", .02), ("roll", .05235987756), ("pitch", .05235987756)):
+            name = f"pen_cycle_mean_{component}"
+            term_cfg = unwrapped.reward_manager.get_term_cfg(name)
+            if term_cfg.func.__class__.__name__ != "GaitCycleMeanTrackingPenalty":
+                raise AssertionError(f"Unexpected cycle mean term: {name}")
+            if term_cfg.params["component"] != component or term_cfg.params["error_scale"] != scale:
+                raise AssertionError(f"Unexpected cycle mean parameters: {name}")
+            if term_cfg.func.window.ready.any():
+                raise AssertionError("Cycle tracking must not score an incomplete startup window.")
+        if {"pen_zero_vy_cycle_drift", "pen_zero_yaw_cycle_drift", "pen_wheel_target_zero"} & active_rewards:
+            raise AssertionError("Foot retained replaced cycle/target penalties.")
+        for name, std in (("rew_lin_vel_xy", math.sqrt(0.20)), ("rew_ang_vel_z", 0.5)):
+            if unwrapped.reward_manager.get_term_cfg(name).params["std"] != std:
+                raise AssertionError(f"Foot {name} must restore the h08 kernel width.")
+        if "pen_swing_clearance" in active_rewards:
+            raise AssertionError("Foot must not combine the replaced swing penalty with its positive reward.")
+        for name, scale in (("pen_base_lin_acc_xy", 3.0), ("pen_base_yaw_acc", 4.0)):
+            params = getattr(unwrapped.cfg.rewards, name).params
+            if params["kernel"] != "charbonnier" or params["acceleration_scale"] != scale:
+                raise AssertionError(f"Unexpected Foot acceleration kernel: {name}, {params}")
+            if params["min_tracking_gate"] != 0.1 or params["tracking_std"] != 0.30:
+                raise AssertionError(f"Unexpected Foot acceleration tracking gate: {name}")
+        if unwrapped.cfg.rewards.pen_base_lin_acc_xy.params["linear_velocity_frame"] != "world":
+            raise AssertionError("Foot XY acceleration must be evaluated in world coordinates.")
+        if "pen_joint_vel_wheel_l2" in active_rewards:
+            raise AssertionError("Foot retained the replaced global wheel-speed L2 penalty.")
+        wheel_speed_cfg = unwrapped.cfg.rewards.pen_wheel_actual_speed
+        if wheel_speed_cfg.func.__name__ != "wheel_actual_speed_huber":
+            raise AssertionError(f"Unexpected Foot actual-wheel-speed function: {wheel_speed_cfg.func.__name__}")
+        if wheel_speed_cfg.params["speed_scale"] != 1.0:
+            raise AssertionError(f"Unexpected Foot wheel-speed Huber scale: {wheel_speed_cfg.params['speed_scale']}")
+        unexpected_gate_params = {"contact_sensor_names", "force_off", "force_on"} & wheel_speed_cfg.params.keys()
+        if unexpected_gate_params:
+            raise AssertionError(f"Foot wheel-speed reward retained contact-gate params: {unexpected_gate_params}")
         if height_cfg.func.__name__ != "body_height_command_plane_grounded_l2":
             raise AssertionError(f"Foot height penalty is not local-plane based: {height_cfg.func.__name__}")
         height_exp_cfg = unwrapped.reward_manager.get_term_cfg("rew_base_height_exp")
@@ -424,21 +588,68 @@ def main() -> None:
             raise AssertionError(f"Unexpected Foot exponential height reward: {height_exp_cfg.func.__name__}")
         if height_exp_cfg.params["std"] != 0.05:
             raise AssertionError(f"Unexpected Foot exponential height std: {height_exp_cfg.params['std']}")
-        removed_foot_rewards = {"pen_swing_height", "pen_wheel_landing_impact"} & active_rewards
+        removed_foot_rewards = {"pen_swing_height", "pen_wheel_landing_impact", "pen_swing_clearance"} & active_rewards
         if removed_foot_rewards:
             raise AssertionError(f"Foot retained replaced swing/landing rewards: {sorted(removed_foot_rewards)}")
         regulation_cfg = unwrapped.reward_manager.get_term_cfg("pen_feet_regulation")
         if regulation_cfg.func.__name__ != "wheel_terrain_feet_regulation":
             raise AssertionError(f"Unexpected Foot regulation function: {regulation_cfg.func.__name__}")
-        if regulation_cfg.params["height_scale"] != 0.65:
+        if regulation_cfg.params["height_scale"] != 0.05:
             raise AssertionError(f"Unexpected Foot regulation height scale: {regulation_cfg.params['height_scale']}")
+        width_cfg = unwrapped.reward_manager.get_term_cfg("pen_feet_distance")
+        if width_cfg.func.__name__ != "foot_lateral_width_huber":
+            raise AssertionError("Foot width must use signed lateral distance, not total XY distance.")
+        for key, expected in (("min_width", 0.30), ("max_width", 0.38), ("error_scale", 0.05)):
+            if width_cfg.params[key] != expected:
+                raise AssertionError(f"Unexpected Foot width parameter {key}: {width_cfg.params[key]}")
+        swing_cfg = unwrapped.reward_manager.get_term_cfg("rew_swing_clearance")
+        if swing_cfg.func.__class__.__name__ != "TerrainCycleSwingClearanceExp":
+            raise AssertionError("Foot swing clearance must adapt to the full terrain height scan.")
+        for key, expected in (("min_peak_height", 0.05), ("max_peak_height", 0.10),
+                              ("switch_center", 0.04), ("switch_band", 0.01),
+                              ("std", 0.025)):
+            if swing_cfg.params[key] != expected:
+                raise AssertionError(f"Unexpected Foot swing parameter {key}: {swing_cfg.params[key]}")
+        if {"velocity_command_name", "body_height_command_name", "lin_threshold", "ang_threshold"} & swing_cfg.params.keys():
+            raise AssertionError("Foot swing clearance must remain active at zero command and independent of base height.")
+        swing_term = swing_cfg.func
+        if not torch.isfinite(swing_term.peak_height).all():
+            raise AssertionError("Non-finite adaptive swing peak.")
+        if not torch.all((swing_term.peak_height >= 0.05) & (swing_term.peak_height <= 0.10)):
+            raise AssertionError("Adaptive swing peak is outside 5-10 cm.")
+        gait_cfg = unwrapped.reward_manager.get_term_cfg("gait_contact_schedule")
+        for key, expected in (("force_kernel", "huber"), ("force_reference", 100.0),
+                              ("tracking_contacts_shaped_force", -6.0), ("tracking_contacts_shaped_vel", -2.0)):
+            if gait_cfg.params[key] != expected:
+                raise AssertionError(f"Unexpected Foot gait parameter {key}: {gait_cfg.params[key]}")
+        for cfg in (width_cfg, swing_cfg, gait_cfg):
+            names = unwrapped.scene["robot"].body_names
+            resolved_names = [names[index] for index in cfg.params["asset_cfg"].body_ids]
+            if resolved_names != ["wheel_L_Link", "wheel_R_Link"]:
+                raise AssertionError(f"Foot geometry rewards require left/right order: {resolved_names}")
+        contact_names = unwrapped.scene.sensors["contact_forces"].body_names
+        gait_contact_names = [contact_names[index] for index in gait_cfg.params["sensor_cfg"].body_ids]
+        if gait_contact_names != ["wheel_L_Link", "wheel_R_Link"]:
+            raise AssertionError(f"Gait force and swing phases must share left/right order: {gait_contact_names}")
         landing_cfg = unwrapped.reward_manager.get_term_cfg("foot_landing_vel")
         if landing_cfg.func.__name__ != "wheel_terrain_landing_velocity_l2":
             raise AssertionError(f"Unexpected Foot landing function: {landing_cfg.func.__name__}")
-        if landing_cfg.params["about_landing_threshold"] != 0.08:
+        if landing_cfg.params["about_landing_threshold"] != 0.02:
             raise AssertionError(
                 f"Unexpected Foot pre-landing threshold: {landing_cfg.params['about_landing_threshold']}"
             )
+        if "pen_all_wheels_air_time" in active_rewards:
+            raise AssertionError("Old simultaneous-air-time cost must be removed.")
+        if landing_cfg.params["allowed_downward_speed"] != 0.2:
+            raise AssertionError("Expected a 0.2 m/s landing speed allowance.")
+        for name in ("pen_joint_torque", "pen_joint_accel", "pen_joint_power_l1"):
+            selected = unwrapped.reward_manager.get_term_cfg(name).params["asset_cfg"]
+            names = [unwrapped.scene["robot"].joint_names[i] for i in selected.joint_ids]
+            if len(names) != 6 or any("wheel" in name for name in names):
+                raise AssertionError(f"Foot regularizer must select six leg joints: {name}: {names}")
+        for name in ("pen_action_rate", "pen_action_smoothness"):
+            if unwrapped.reward_manager.get_term_cfg(name).params["action_dim"] != 6:
+                raise AssertionError(f"Foot action regularizer must exclude wheel outputs: {name}")
         gait_command_cfg = unwrapped.command_manager.get_term("gait_command").cfg
         if gait_command_cfg.ranges.swing_height != (0.0, 0.0):
             raise AssertionError(

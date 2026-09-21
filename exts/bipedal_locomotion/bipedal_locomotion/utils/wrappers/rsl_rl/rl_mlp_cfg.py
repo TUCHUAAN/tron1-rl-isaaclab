@@ -17,6 +17,8 @@ class RslRlPpoAlgorithmMlpCfg(RslRlPpoAlgorithmCfg):
     # runner_type: str = "OnPolicyRunner"
 
     obs_history_len: int = 1
+    est_learning_rate: float = 1.0e-3
+    anneal_lr: bool = False
 
 
 @configclass

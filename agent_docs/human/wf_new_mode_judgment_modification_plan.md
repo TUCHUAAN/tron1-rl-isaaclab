@@ -1,4 +1,6 @@
-# Wheel 合规奖励实现说明
+# Wheel 合规奖励历史实现说明（2026-08-05）
+
+> 本文保留最初的双轮合规奖励设计与验证记录，不代表 2026-09-15 当前最终配置。当前 Wheel 已将速度/Yaw 门控从 `C_all=min(C_L,C_R)` 改为 `C_any=max(C_L,C_R)`，删除逐轮 `wheel air time`，并加入显式 PI、Yaw 加速度项及后续权重调整。现行定义以 `wf_dual_mode_reward_penalty_table.md` 为准。
 
 ## 目标
 

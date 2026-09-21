@@ -43,6 +43,39 @@ from rsl_rl.modules import MLP_Encoder, ActorCritic
 from rsl_rl.env import VecEnv
 
 
+def compact_episode_tag(key: str) -> str:
+    """Short display tags only; preserve diagnostic keys and scalar values."""
+    for prefix, group in (("Episode_Reward/", "Reward/"),
+                          ("Episode_Termination/", "Termination/")):
+        if key.startswith(prefix):
+            return group + key[len(prefix):]
+    prefix = "Metrics/base_velocity/"
+    if key.startswith(prefix):
+        metric = key[len(prefix):]
+        if metric.startswith("foothold/"):
+            return "Foothold/" + metric[len("foothold/"):]
+        if metric.startswith("cycle_mean_") and "/" in metric:
+            component, stat = metric[len("cycle_mean_"):].split("/", 1)
+            stat = stat.replace("abs_error_", "abs_").replace("rms_error_", "rms_")
+            stat = {"valid_fraction": "valid", "duration_s": "period_s", "samples": "n"}.get(stat, stat)
+            return f"CycleMean/{component}_{stat}"
+        if metric.startswith("height_") and "/" in metric:
+            height, stat = metric[len("height_"):].split("/", 1)
+            stat = {"swing_clearance_m": "clearance_m", "swing_target_m": "target_m",
+                    "swing_shortfall_m": "shortfall_m", "leg_soft_limit_excess_rad": "joint_excess_rad",
+                    "swing_samples": "swing_n", "step_samples": "step_n"}.get(stat, stat)
+            return f"Swing/{height}_{stat}"
+        if metric.startswith("wheel_raw_output_"):
+            stat = metric[len("wheel_raw_output_"):].replace("same_sign_over_limit_rate", "same_limit_rate")
+            return "WheelRaw/" + stat
+        return "Tracking/" + metric.replace("/", "_")
+    if key.startswith("Metrics/"):
+        return key
+    if key.startswith("Curriculum/"):
+        return key
+    return "Episode/" + key
+
+
 class OnPolicyRunner:
     def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
         self.cfg = train_cfg
@@ -290,7 +323,7 @@ class OnPolicyRunner:
                         ep_info[key] = ep_info[key].unsqueeze(0)
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
-                self.writer.add_scalar("Episode/" + key, value, locs["it"])
+                self.writer.add_scalar(compact_episode_tag(key), value, locs["it"])
                 ep_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
         # mean_std = self.alg.actor_critic.std.mean()
         mean_std = torch.exp(self.alg.actor_critic.logstd).mean()

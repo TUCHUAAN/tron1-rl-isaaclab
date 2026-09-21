@@ -21,6 +21,134 @@ _SPEC.loader.exec_module(reward_math)
 
 
 class RewardMathTest(unittest.TestCase):
+    def test_lateral_width_does_not_accept_fore_aft_or_height_separation(self):
+        feet = torch.tensor([
+            [[0.0, 0.17, 0.128], [0.0, -0.17, 0.128]],
+            [[0.4, 0.17, 0.178], [-0.4, -0.17, 0.128]],
+            [[0.4, 0.075, 0.178], [-0.4, -0.075, 0.128]],
+            [[0.0, -0.17, 0.128], [0.0, 0.17, 0.128]],
+            [[0.0, 0.25, 0.128], [0.0, -0.25, 0.128]],
+        ])
+        quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(5, 1)
+        cost = reward_math.lateral_foot_width_penalty(feet, quat, 0.30, 0.38, 0.05)
+        torch.testing.assert_close(cost[:2], torch.zeros(2))
+        self.assertGreater(float(cost[2]), 0.0)
+        self.assertGreater(float(cost[3]), float(cost[2]))
+        self.assertGreater(float(cost[4]), 0.0)
+
+    def test_lateral_width_is_translation_yaw_and_base_roll_invariant(self):
+        feet = torch.tensor([[[0.3, 0.1, 0.3], [-0.3, -0.1, 0.128]]])
+        quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+        reference = reward_math.lateral_foot_width_penalty(feet, quat, 0.30, 0.38, 0.05)
+        # Rotate world positions and heading by 90 degrees, then add base roll.
+        rotated = feet.clone()
+        rotated[:, :, 0] = -feet[:, :, 1]
+        rotated[:, :, 1] = feet[:, :, 0]
+        rotated += torch.tensor([10.0, -7.0, 3.0])
+        roll = 0.4
+        c, s = math.cos(roll / 2), math.sin(roll / 2)
+        rotated_quat = torch.tensor([[c, s, s, c]]) / math.sqrt(2)
+        actual = reward_math.lateral_foot_width_penalty(rotated, rotated_quat, 0.30, 0.38, 0.05)
+        torch.testing.assert_close(actual, reference, atol=2.0e-5, rtol=0.0)
+
+    def test_lateral_width_cost_keeps_increasing_outside_band(self):
+        widths = torch.tensor([0.34, 0.25, 0.15, 0.0, -0.2], requires_grad=True)
+        feet = torch.zeros(5, 2, 3)
+        feet[:, 0, 1] = widths / 2
+        feet[:, 1, 1] = -widths / 2
+        quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(5, 1)
+        cost = reward_math.lateral_foot_width_penalty(feet, quat, 0.30, 0.38, 0.05)
+        self.assertTrue(torch.all(cost[1:] > cost[:-1]))
+        cost.sum().backward()
+        self.assertTrue(torch.isfinite(widths.grad).all())
+        self.assertTrue(torch.all(widths.grad[1:] < 0.0))
+
+    def test_swing_band_prefers_clearance_over_dragging_without_rewarding_excess(self):
+        clearance = torch.tensor([[0., 0.], [.08, 0.], [.09, 0.], [.10, 0.], [.18, 0.]])
+        cost = reward_math.phase_swing_clearance_penalty(
+            clearance, torch.tensor([[.75, .25]]).repeat(5, 1), torch.full((5,), .5),
+            torch.tensor([[0., 1.]]).repeat(5, 1), torch.ones(5, 2, dtype=torch.bool),
+            torch.full((5,), .08),
+        )
+        torch.testing.assert_close(cost[1:4], torch.zeros(3), atol=1.e-10, rtol=0.)
+        self.assertGreater(float(cost[0]), float(cost[4]))
+        self.assertGreater(float(cost[4]), 0.)
+        torch.testing.assert_close(cost[0], 10 * cost[4])
+
+    def test_swing_cost_requires_valid_ground_and_opposite_support(self):
+        clearance = torch.zeros(5, 2)
+        clearance[3, 0] = torch.nan
+        valid = torch.ones(5, 2, dtype=torch.bool)
+        valid[4, 1] = False
+        support = torch.tensor([[0., 1.], [0., 0.], [1., 1.], [0., 1.], [0., 1.]])
+        cost = reward_math.phase_swing_clearance_penalty(
+            clearance, torch.tensor([[.75, .25]]).repeat(5, 1), torch.full((5,), .5),
+            support, valid, torch.full((5,), .08),
+        )
+        # A swing foot still on the ground must incur the same shortfall cost.
+        torch.testing.assert_close(cost, torch.tensor([3.5, 0., 3.5, 0., 0.]))
+
+    def test_swing_cost_preserves_soft_support_and_swaps_with_phase(self):
+        cost = reward_math.phase_swing_clearance_penalty(
+            torch.zeros(3, 2), torch.tensor([[.75, .25], [.25, .75], [.5, 0.]]),
+            torch.full((3,), .5), torch.tensor([[0., .25], [.25, 0.], [1., 1.]]),
+            torch.ones(3, 2, dtype=torch.bool), torch.full((3,), .08),
+        )
+        torch.testing.assert_close(cost, torch.tensor([.875, .875, 0.]))
+
+    def test_swing_band_uses_each_environments_peak_with_fixed_error_scale(self):
+        cost = reward_math.phase_swing_clearance_penalty(
+            torch.tensor([[.09, 0.], [.12, 0.]]), torch.tensor([[.75, .25]]).repeat(2, 1),
+            torch.full((2,), .5), torch.tensor([[0., 1.]]).repeat(2, 1),
+            torch.ones(2, 2, dtype=torch.bool), torch.tensor([.05, .08]),
+        )
+        torch.testing.assert_close(cost, torch.full((2,), .05))
+
+    def test_scan_peak_clamps_range_ignores_invalid_rays_and_world_offset(self):
+        hits = torch.zeros(6, 121, 3)
+        hits[:, -1, 2] = torch.tensor([0., .01, .02, .06, .10, .30])
+        hits[:, 0] = torch.inf
+        hits[:, 1] = torch.nan
+        target, valid = reward_math.terrain_swing_peak_height(hits)
+        torch.testing.assert_close(target, torch.tensor([.02, .02, .02, .06, .10, .10]))
+        self.assertTrue(valid.all())
+        shifted, _ = reward_math.terrain_swing_peak_height(hits + 3.)
+        torch.testing.assert_close(shifted, target)
+        hits[0].fill_(torch.inf)
+        hits[1].fill_(torch.nan)
+        hits[1, 0] = 0.
+        target, valid = reward_math.terrain_swing_peak_height(hits)
+        self.assertFalse(valid[:2].any())
+        self.assertTrue(torch.isfinite(target).all())
+
+    def test_foot_geometry_validates_scales_and_tensor_shapes(self):
+        feet, quat = torch.zeros(1, 2, 3), torch.tensor([[1., 0., 0., 0.]])
+        for lo, hi, scale in ((.38, .30, .05), (.30, .38, 0.)):
+            with self.assertRaises(ValueError):
+                reward_math.lateral_foot_width_penalty(feet, quat, lo, hi, scale)
+        with self.assertRaises(ValueError):
+            reward_math.lateral_foot_width_penalty(feet[:, :1], quat, .30, .38, .05)
+        with self.assertRaises(ValueError):
+            reward_math.phase_swing_clearance_penalty(
+                torch.zeros(1, 2), torch.zeros(1, 2), torch.full((1,), .5),
+                torch.ones(1, 2), torch.ones(1, 2, dtype=torch.bool), torch.full((1,), .08),
+                error_scale=0.,
+            )
+        with self.assertRaises(ValueError):
+            reward_math.terrain_swing_peak_height(torch.zeros(1, 1, 3))
+
+    def test_acceleration_gate_floor_retains_cost_at_large_tracking_error(self):
+        for func in (reward_math.bounded_acceleration_tracking_penalty,
+                     reward_math.charbonnier_acceleration_tracking_penalty):
+            args = (torch.tensor([16., 16., 16.]), torch.tensor([0., 1., 1.]),
+                    torch.tensor([1., 1., 0.]))
+            old = func(*args, acceleration_scale=4., tracking_std=.3)
+            new = func(*args, acceleration_scale=4., tracking_std=.3, min_tracking_gate=.1)
+            torch.testing.assert_close(new[0], old[0])
+            torch.testing.assert_close(new[1], .1 * new[0])
+            torch.testing.assert_close(new[2], torch.tensor(0.))
+            self.assertGreater(float(new[1]), 1000 * float(old[1]))
+
     def test_contact_force_excess_l2_grows_with_load(self):
         force = torch.zeros(2, 3, 2, 3)
         force[0, 0, 0, 2] = 10.0
@@ -57,6 +185,28 @@ class RewardMathTest(unittest.TestCase):
         expected = torch.tensor([[1.0, 0.0], [0.5, 1.0]])
         torch.testing.assert_close(confidence, expected)
         torch.testing.assert_close(reward_math.all_support_confidence(confidence), torch.tensor([0.0, 0.5]))
+
+    def test_wheel_speed_huber_is_ungated_and_keeps_linear_tail(self):
+        wheel_velocity = torch.tensor([[0.0, 0.5], [1.0, 3.0], [10.0, 10.0]])
+        penalty = reward_math.wheel_speed_huber(
+            wheel_velocity,
+            speed_scale=1.0,
+        )
+        torch.testing.assert_close(penalty, torch.tensor([0.125, 3.0, 19.0]))
+
+        with self.assertRaises(ValueError):
+            reward_math.wheel_speed_huber(
+                wheel_velocity,
+                speed_scale=0.0,
+            )
+
+    def test_wheel_target_deadband_l2_allows_small_braking_targets(self):
+        wheel_target = torch.tensor([[0.0, 0.1], [0.2, -1.0]])
+        penalty = reward_math.wheel_target_deadband_l2(wheel_target, target_deadband=0.1)
+        torch.testing.assert_close(penalty, torch.tensor([0.0, 0.82]), atol=1.0e-6, rtol=0.0)
+
+        with self.assertRaises(ValueError):
+            reward_math.wheel_target_deadband_l2(wheel_target, target_deadband=-0.1)
 
     def test_mean_support_confidence_is_soft_single_support_gate(self):
         confidence = torch.tensor([[1.0, 1.0], [1.0, 0.0], [0.25, 0.75], [0.0, 0.0]])

@@ -118,7 +118,7 @@ def get_gait_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Get the current gait phase as observation.
 
     The gait phase is represented by [sin(phase), cos(phase)] to ensure continuity.
-    The phase is calculated based on the episode length and gait frequency.
+    The command term owns the shared clock, including continuous-frequency mode.
 
     Returns:
         torch.Tensor: The gait phase observation. Shape: (num_envs, 2).
@@ -129,8 +129,7 @@ def get_gait_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
 
     # Get the gait command from command manager
     command_term = env.command_manager.get_term("gait_command")
-    # Calculate gait indices based on episode length
-    gait_indices = torch.remainder(env.episode_length_buf * env.step_dt * command_term.command[:, 0], 1.0)
+    gait_indices = command_term.phase
     # Reshape gait_indices to (num_envs, 1)
     gait_indices = gait_indices.unsqueeze(-1)
     # Convert to sin/cos representation
@@ -190,3 +189,13 @@ def joint_pos_rel_exclude_wheel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCf
     all_joints_idx = range(asset.num_joints)
     pos_idx_exclude_wheel = [i for i in all_joints_idx if i not in wheel_joints_idx]
     return asset.data.joint_pos[:, pos_idx_exclude_wheel] - asset.data.default_joint_pos[:, pos_idx_exclude_wheel]
+
+
+def zero_command_hold_observation(env: ManagerBasedRLEnv,
+                                  reward_name: str = "pen_zero_command_hold") -> torch.Tensor:
+    """Six signed normalized hold errors/flags from the reward's shared tracker."""
+    # ObservationManager probes dimensions before RewardManager is constructed.
+    if not hasattr(env, 'reward_manager'):
+        return torch.zeros(env.num_envs, 6, device=env.device)
+    term = env.reward_manager.get_term_cfg(reward_name).func
+    return term.observe(env)

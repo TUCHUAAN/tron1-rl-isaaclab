@@ -26,6 +26,14 @@ from .limx_wheelfoot_env_cfg import WFBaseEnvCfg, WFBaseEnvCfg_PLAY
 WHEEL_LINKS = "wheel_[LR]_Link"
 WHEEL_BODY_NAMES = ["wheel_L_Link", "wheel_R_Link"]
 WHEEL_JOINTS = ["wheel_L_Joint", "wheel_R_Joint"]
+LEG_JOINTS = [
+    "abad_L_Joint",
+    "abad_R_Joint",
+    "hip_L_Joint",
+    "hip_R_Joint",
+    "knee_L_Joint",
+    "knee_R_Joint",
+]
 WHEEL_RADIUS = 0.128
 WHEEL_GROUND_CONTACT_SENSORS = ("wheel_L_ground_contact", "wheel_R_ground_contact")
 WHEEL_GROUND_SCAN_SENSORS = ("wheel_L_ground_scan", "wheel_R_ground_scan")
@@ -122,6 +130,11 @@ def _configure_common_mode(cfg, *, play: bool):
         func=mdp.get_gait_command, params={"command_name": "gait_command"}
     )
 
+    # Append identical hold state after the existing gait inputs. History stays
+    # proprioceptive: the actor and critic receive the current reference error.
+    for group in (cfg.observations.policy, cfg.observations.critic):
+        group.zero_command_hold = ObsTerm(func=mdp.zero_command_hold_observation)
+
     support_params = {
         "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
         "force_off": 5.0,
@@ -169,8 +182,43 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        self.rewards.pen_zero_command_hold = RewTerm(
+            func=mdp.ZeroCommandHoldPenalty, weight=-0.5,
+            params={
+                "asset_cfg": SceneEntityCfg("robot"), "command_name": "base_velocity",
+                "tracker_options": {
+                    "zero_threshold": 0.02, "settle_time": 0.3, "window_s": 1.0,
+                    "position_deadband": 0.015, "position_scale": 0.05,
+                    "yaw_deadband": 0.03, "yaw_scale": 0.10, "max_cost": 5.0,
+                },
+            },
+        )
+
         _configure_common_mode(self, play=False)
         self.rewards.stand_still.weight = -7.0
+
+        # The Wheel expert uses an explicit PI wheel-velocity controller.  Keep
+        # the PhysX wheel drives passive so implicit gains are not added on top
+        # of the PI effort, and leave the existing actuator-gain randomization
+        # scoped to the six leg joints.
+        self.scene.robot.actuators["wheels"].stiffness = 0.0
+        self.scene.robot.actuators["wheels"].damping = 0.0
+        self.events.robot_joint_stiffness_and_damping.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=LEG_JOINTS
+        )
+        self.events.randomize_actuator_gains.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=LEG_JOINTS
+        )
+        self.actions.joint_vel = mdp.WheelVelocityPIActionCfg(
+            asset_name="robot",
+            joint_names=WHEEL_JOINTS,
+            scale=1.0,
+            preserve_order=True,
+            kp=2.0,
+            kp_scale_range=(0.25, 2.0),
+            ki_ratio_range=(0.0, 0.25),
+            effort_limit=80.0,
+        )
 
         self.scene.terrain.terrain_type = "generator"
         self.scene.terrain.terrain_generator = WHEEL_MODE_TERRAINS_CFG
@@ -221,7 +269,7 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
         )
         self.rewards.pen_base_lin_acc_xy = RewTerm(
             func=mdp.BaseVelocityAccelerationPenalty,
-            weight=-0.02,
+            weight=0.0,
             params={
                 "command_name": "base_velocity",
                 "component": "xy",
@@ -233,7 +281,7 @@ class WFWheelModeEnvCfg(WFBaseEnvCfg):
         )
         self.rewards.pen_base_yaw_acc = RewTerm(
             func=mdp.BaseVelocityAccelerationPenalty,
-            weight=-0.02,
+            weight=-0.025,
             params={
                 "command_name": "base_velocity",
                 "component": "yaw",
@@ -413,6 +461,9 @@ class WFWheelModeEnvCfg_PLAY(WFWheelModeEnvCfg):
         self.scene.wheel_L_ground_scan.debug_vis = True
         self.scene.wheel_R_ground_scan.debug_vis = True
         self.observations.policy.enable_corruption = False
+        # Evaluation uses the nominal PI controller deterministically.
+        self.actions.joint_vel.kp_scale_range = (1.0, 1.0)
+        self.actions.joint_vel.ki_ratio_range = (0.25, 0.25)
         self.events.push_robot = None
         self.events.add_base_mass = None
         self.scene.terrain.terrain_generator = WHEEL_MODE_TERRAINS_PLAY_CFG
@@ -432,20 +483,52 @@ class WFWheelHeightPretrainEnvCfg(WFWheelModeEnvCfg):
 
 @configclass
 class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
-    """Foot expert: wheel-speed targets are hard-masked to zero on all terrain."""
+    """Foot expert with fixed-zero PI wheel references and cycle-latched swing peaks."""
 
     def __post_init__(self):
         super().__post_init__()
+        self.rewards.pen_zero_command_hold = RewTerm(
+            func=mdp.ZeroCommandHoldPenalty, weight=-0.5,
+            params={
+                "asset_cfg": SceneEntityCfg("robot"), "command_name": "base_velocity",
+                "tracker_options": {
+                    "zero_threshold": 0.02, "settle_time": 0.3, "window_s": 1.0,
+                    "position_deadband": 0.03, "position_scale": 0.05,
+                    "yaw_deadband": 0.03, "yaw_scale": 0.10, "max_cost": 5.0,
+                },
+            },
+        )
+
         _configure_common_mode(self, play=False)
 
         self.scene.terrain.terrain_type = "generator"
         self.scene.terrain.terrain_generator = FOOT_ALL_TERRAINS_CFG
         self.scene.terrain.max_init_terrain_level = 0
 
-        # Hard action-layer constraint: processed wheel velocity target is always zero.
-        self.actions.joint_vel.scale = 0.0
-        self.actions.joint_vel.offset = 0.0
-        self.actions.joint_vel.use_default_offset = True
+        # Fix Foot wheel-speed targets to zero and brake with explicit PI,
+        # shared with deployment. Implicit wheel
+        # drives are disabled and their gains are excluded from the generic
+        # actuator randomization to avoid stacking two controllers.
+        self.scene.robot.actuators["wheels"].stiffness = 0.0
+        self.scene.robot.actuators["wheels"].damping = 0.0
+        self.events.robot_joint_stiffness_and_damping.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=LEG_JOINTS
+        )
+        self.events.randomize_actuator_gains.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=LEG_JOINTS
+        )
+        self.actions.joint_vel = mdp.WheelVelocityPIActionCfg(
+            asset_name="robot",
+            joint_names=WHEEL_JOINTS,
+            scale=1.0,
+            clip={"wheel_.*": (0.0, 0.0)},
+            fixed_zero_target=True,
+            preserve_order=True,
+            kp=2.0,
+            kp_scale_range=(0.25, 2.0),
+            ki_ratio_range=(0.0, 0.25),
+            effort_limit=80.0,
+        )
 
         self.commands.body_height.ranges.height = BODY_HEIGHT_RANGE
         self.commands.body_height.max_rate = 0.06
@@ -455,9 +538,30 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
         self.commands.base_velocity.ranges.lin_vel_y = (-0.4, 0.4)
         self.commands.base_velocity.ranges.ang_vel_z = (-0.8, 0.8)
         self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
-        # Preserve the shared four-dimensional checkpoint schema, but remove
-        # the unused target-height signal now that swing clearance is learned
-        # from terrain observations instead of explicitly commanded.
+        velocity_cfg = self.commands.base_velocity
+        self.commands.base_velocity = mdp.FootVelocityCommandCfg(
+            asset_name=velocity_cfg.asset_name,
+            heading_command=velocity_cfg.heading_command,
+            heading_control_stiffness=velocity_cfg.heading_control_stiffness,
+            rel_standing_envs=0.15,
+            rel_heading_envs=0.0,
+            rel_straight_envs=0.25,
+            rel_lateral_envs=0.10,
+            rel_yaw_only_envs=0.20,
+            rel_mixed_envs=0.30,
+            ranges=velocity_cfg.ranges,
+            resampling_time_range=velocity_cfg.resampling_time_range,
+            debug_vis=velocity_cfg.debug_vis,
+            goal_vel_visualizer_cfg=velocity_cfg.goal_vel_visualizer_cfg,
+            current_vel_visualizer_cfg=velocity_cfg.current_vel_visualizer_cfg,
+            wheel_body_names=tuple(WHEEL_BODY_NAMES),
+            leg_joint_names=tuple(LEG_JOINTS),
+            terrain_sensor_names=WHEEL_GROUND_SCAN_SENSORS,
+            wheel_radius=WHEEL_RADIUS,
+        )
+        # Preserve the shared four-dimensional checkpoint schema. The swing
+        # clearance target is a reward parameter, not an observation command.
+        self.commands.gait_command.continuous_phase = True
         self.commands.gait_command.ranges.durations = (0.5, 0.5)
         self.commands.gait_command.ranges.swing_height = (0.0, 0.0)
 
@@ -470,6 +574,81 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
         self.rewards.pen_action_smoothness.weight = -0.04
         self.rewards.pen_joint_power_l1.weight = -5.0e-4
         self.rewards.pen_vel_non_wheel_l2.weight = -1.0e-3
+        for name in ("pen_joint_torque", "pen_joint_accel", "pen_joint_power_l1"):
+            getattr(self.rewards, name).params["asset_cfg"] = SceneEntityCfg(
+                "robot", joint_names=LEG_JOINTS, preserve_order=True,
+            )
+        self.rewards.pen_action_rate.func = mdp.leg_action_rate_l2
+        self.rewards.pen_action_rate.params = {"action_dim": 6}
+        self.rewards.pen_action_smoothness.params = {"action_dim": 6}
+
+        # Foot must keep stepping even at zero command. Track base motion
+        # independently of gait, restoring the wider h08 tracking kernels.
+        self.rewards.rew_lin_vel_xy.weight = 5.5
+        self.rewards.rew_lin_vel_xy.params["std"] = math.sqrt(0.20)
+        self.rewards.rew_ang_vel_z.weight = 3.0
+        self.rewards.rew_ang_vel_z.params["std"] = 0.5
+        self.rewards.pen_lin_vel_xy_tracking_error = RewTerm(
+            func=mdp.lin_vel_xy_tracking_error_huber,
+            weight=-0.5,
+            params={
+                "command_name": "base_velocity",
+                "asset_cfg": SceneEntityCfg("robot"),
+                "error_scale": 0.4,
+            },
+        )
+        self.rewards.pen_yaw_tracking_error = RewTerm(
+            func=mdp.ang_vel_z_tracking_error_huber,
+            weight=-1.0,
+            params={
+                "command_name": "base_velocity",
+                "asset_cfg": SceneEntityCfg("robot"),
+                "error_scale": 0.5,
+            },
+        )
+        acceleration_params = {
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", body_names=WHEEL_BODY_NAMES, preserve_order=True),
+            "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+            "terrain_sensor_names": WHEEL_GROUND_SCAN_SENSORS,
+            "wheel_radius": WHEEL_RADIUS,
+            "force_off": 5.0,
+            "force_on": 10.0,
+            "geometry_tolerance_on": 0.02,
+            "geometry_tolerance_off": 0.035,
+            "tracking_std": 0.30,
+            "min_tracking_gate": 0.1,
+            "kernel": "charbonnier",
+        }
+        self.rewards.pen_base_lin_acc_xy = RewTerm(
+            func=mdp.BaseVelocityAccelerationPenalty,
+            weight=0.0,
+            params={
+                **acceleration_params, "component": "xy", "acceleration_scale": 3.0,
+                "linear_velocity_frame": "world",
+            },
+        )
+        self.rewards.pen_base_yaw_acc = RewTerm(
+            func=mdp.BaseVelocityAccelerationPenalty,
+            weight=0.0,
+            params={**acceleration_params, "component": "yaw", "acceleration_scale": 4.0},
+        )
+
+        # v8: mean signed tracking errors over a full gait cycle, alongside
+        # unchanged instantaneous tracking. Weights/scales are initial values.
+        for component, weight, scale in (
+            ("vx", -1.0, 0.2), ("vy", -1.0, 0.2), ("yaw", -1.0, 0.3),
+            ("height", -0.1, 0.02), ("roll", -0.1, 0.05235987756),
+            ("pitch", -0.1, 0.05235987756),
+        ):
+            setattr(self.rewards, f"pen_cycle_mean_{component}", RewTerm(
+                func=mdp.GaitCycleMeanTrackingPenalty, weight=weight,
+                params={
+                    "command_name": "base_velocity", "gait_command_name": "gait_command",
+                    "asset_cfg": SceneEntityCfg("robot"), "component": component,
+                    "error_scale": scale,
+                },
+            ))
 
         # Use the same local-plane height definition and any-wheel support gate
         # as Wheel Expert, while retaining Foot's existing L2 weight.
@@ -488,15 +667,26 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
         )
         self.rewards.rew_base_height_exp = RewTerm(
             func=mdp.body_height_command_plane_grounded_exp,
-            weight=1.0,
+            weight=1.5,
             params={**height_params, "std": 0.05},
         )
 
         self.rewards.rew_same_foot_x_position = None
-        # Match PF: prevent the support ends from becoming too close without
-        # constraining their fore-aft separation during a normal step.
-        self.rewards.pen_feet_distance.params["min_feet_distance"] = 0.115
-        self.rewards.pen_feet_distance.params["max_feet_distance"] = 1.0
+        # Constrain signed lateral width in the heading frame. A long forward
+        # step cannot disguise narrow/crossed legs as it could with XY distance.
+        # The band surrounds the shared nominal wheel-center width of 0.34 m.
+        self.rewards.pen_feet_distance = RewTerm(
+            func=mdp.foot_lateral_width_huber,
+            weight=-1.0,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", body_names=WHEEL_BODY_NAMES, preserve_order=True
+                ),
+                "min_width": 0.30,
+                "max_width": 0.38,
+                "error_scale": 0.05,
+            },
+        )
         # Foot locomotion should follow the local support slope instead of
         # being pulled toward a world-horizontal base orientation.
         self.rewards.pen_flat_orientation_l2 = None
@@ -505,7 +695,20 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
             weight=-10.0,
             params={"sensor_cfg": SceneEntityCfg("height_scanner")},
         )
-        self.rewards.pen_joint_vel_wheel_l2.weight = -0.10
+        # Penalize sustained actual wheel rotation in every contact state.
+        # Foot uses a fixed zero target; PI still supplies braking effort.
+        self.rewards.pen_joint_vel_wheel_l2 = None
+        self.rewards.pen_wheel_actual_speed = RewTerm(
+            func=mdp.wheel_actual_speed_huber,
+            weight=0.0,
+            params={
+                "asset_cfg": SceneEntityCfg(
+                    "robot", joint_names=WHEEL_JOINTS, preserve_order=True
+                ),
+                "speed_scale": 1.0,
+            },
+        )
+        self.rewards.pen_wheel_target_zero = None
         self.rewards.undesired_contacts.weight = -1.0
         self.rewards.pen_knee_contact_force = RewTerm(
             func=mdp.undesired_contact_force_l2,
@@ -533,14 +736,20 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
             func=mdp.GaitReward,
             weight=1.0,
             params={
-                "tracking_contacts_shaped_force": -2.0,
+                "tracking_contacts_shaped_force": -6.0,
                 "tracking_contacts_shaped_vel": -2.0,
+                "force_kernel": "huber",
+                "force_reference": 100.0,
                 "gait_force_sigma": 25.0,
                 "gait_vel_sigma": 0.25,
                 "kappa_gait_probs": 0.05,
                 "command_name": "gait_command",
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=WHEEL_LINKS),
-                "asset_cfg": SceneEntityCfg("robot", body_names=WHEEL_LINKS),
+                "sensor_cfg": SceneEntityCfg(
+                    "contact_forces", body_names=WHEEL_BODY_NAMES, preserve_order=True
+                ),
+                "asset_cfg": SceneEntityCfg(
+                    "robot", body_names=WHEEL_BODY_NAMES, preserve_order=True
+                ),
             },
         )
         self.rewards.pen_feet_regulation = RewTerm(
@@ -554,15 +763,75 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
                 ),
                 "terrain_sensor_names": WHEEL_GROUND_SCAN_SENSORS,
                 "wheel_radius": WHEEL_RADIUS,
-                "height_scale": 0.65,
+                "height_scale": 0.05,
             },
         )
-        self.rewards.pen_all_wheels_air_time = RewTerm(
-            func=mdp.all_wheels_air_time_l2,
-            weight=-4.0,
+        self.rewards.pen_swing_clearance = None
+        self.rewards.rew_swing_clearance = RewTerm(
+            func=mdp.TerrainCycleSwingClearanceExp,
+            weight=2.0,
             params={
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=WHEEL_LINKS),
-                "max_air_time": 1.0,
+                "asset_cfg": SceneEntityCfg(
+                    "robot", body_names=WHEEL_BODY_NAMES, preserve_order=True
+                ),
+                "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+                "terrain_sensor_names": WHEEL_GROUND_SCAN_SENSORS,
+                "height_sensor_cfg": SceneEntityCfg("height_scanner"),
+                "gait_command_name": "gait_command",
+                "wheel_radius": WHEEL_RADIUS,
+                "min_peak_height": 0.05,
+                "max_peak_height": 0.10,
+                "switch_center": 0.04,
+                "switch_band": 0.01,
+                "std": 0.025,
+            },
+        )
+        self.rewards.pen_all_wheels_air_time = None
+        self.rewards.pen_planned_support_contact = RewTerm(
+            func=mdp.planned_support_contact_loss, weight=-1.0,
+            params={
+                "command_name": "gait_command",
+                "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+                "kappa_gait_probs": 0.05, "force_off": 5.0, "force_on": 10.0,
+            },
+        )
+        self.rewards.pen_swing_min_clearance = RewTerm(
+            func=mdp.swing_min_clearance_penalty, weight=-1.0,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=WHEEL_BODY_NAMES, preserve_order=True),
+                "terrain_sensor_names": WHEEL_GROUND_SCAN_SENSORS,
+                "gait_command_name": "gait_command", "wheel_radius": WHEEL_RADIUS,
+                "min_clearance": 0.02, "active_start": 0.20, "full_start": 0.35,
+            },
+        )
+        self.rewards.pen_missed_swing = RewTerm(
+            func=mdp.MissedSwingPenalty, weight=-0.2,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=WHEEL_BODY_NAMES, preserve_order=True),
+                "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+                "terrain_sensor_names": WHEEL_GROUND_SCAN_SENSORS,
+                "gait_command_name": "gait_command", "wheel_radius": WHEEL_RADIUS,
+                "tracker_options": {"min_clearance": 0.01, "min_air_time": 0.06,
+                                    "force_off": 5.0, "force_on": 10.0},
+            },
+        )
+        self.rewards.pen_foothold_region = RewTerm(
+            func=mdp.FootholdRegionPenalty, weight=-0.2,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=WHEEL_BODY_NAMES, preserve_order=True),
+                "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
+                "terrain_sensor_names": WHEEL_GROUND_SCAN_SENSORS,
+                "height_sensor_cfg": SceneEntityCfg("height_scanner"),
+                "command_name": "base_velocity", "gait_command_name": "gait_command",
+                "tracker_options": {
+                    "axes": (0.04, 0.03), "nominal_width": 0.34,
+                    "balance_time": 0.10, "max_balance": 0.04,
+                    "max_forward": 0.25, "min_lateral": 0.12, "max_lateral": 0.28,
+                    "max_leg_reach": 0.90, "wheel_radius": WHEEL_RADIUS,
+                    "max_slope_deg": 20.0, "max_relief": 0.015, "scan_distance": 0.085,
+                    "min_air_time": 0.06, "contact_time": 0.04, "min_clearance": 0.01,
+                    "force_off": 5.0, "force_on": 10.0, "max_event_cost": 5.0,
+                },
             },
         )
         self.rewards.foot_landing_vel = RewTerm(
@@ -577,7 +846,8 @@ class WFFootAllTerrainEnvCfg(WFBaseEnvCfg):
                 "contact_sensor_names": WHEEL_GROUND_CONTACT_SENSORS,
                 "terrain_sensor_names": WHEEL_GROUND_SCAN_SENSORS,
                 "wheel_radius": WHEEL_RADIUS,
-                "about_landing_threshold": 0.08,
+                "about_landing_threshold": 0.02,
+                "allowed_downward_speed": 0.2,
                 "contact_force_threshold": 0.1,
             },
         )
@@ -606,6 +876,8 @@ class WFFootAllTerrainEnvCfg_PLAY(WFFootAllTerrainEnvCfg):
         self.viewer.lookat = (0.0, 0.0, 0.3)
         self.scene.height_scanner.debug_vis = True
         self.observations.policy.enable_corruption = False
+        self.actions.joint_vel.kp_scale_range = (1.0, 1.0)
+        self.actions.joint_vel.ki_ratio_range = (0.25, 0.25)
         self.events.push_robot = None
         self.events.add_base_mass = None
         self.scene.terrain.terrain_generator = FOOT_ALL_TERRAINS_PLAY_CFG
@@ -619,5 +891,6 @@ class WFDualModeEnvCfg_PLAY(WFWheelModeEnvCfg_PLAY):
     def __post_init__(self):
         super().__post_init__()
         self.scene.terrain.terrain_generator = FOOT_ALL_TERRAINS_PLAY_CFG
-        # The external FSM masks wheel actions in FOOT mode; keep wheel control active here.
+        # The FSM zeroes Foot wheel targets and blends toward Wheel targets
+        # during transitions; this union environment keeps the wheel PI enabled.
         self.actions.joint_vel.scale = 1.0

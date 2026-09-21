@@ -19,7 +19,38 @@
   --mode foot
 ```
 
-Foot 模式保留网络原始 8 维输出供 `last_action` 观测使用，但在执行器层将左右轮目标速度硬锁为 `0 rad/s`，与训练环境的 `JointVelocityActionCfg(scale=0)` 一致。默认 `wheel` 模式保持原有行为。
+注意：截至 2026-09-15，自动搜索到的最新 Foot run `foot_terrain_phase_modes_v3/model_20000.pt` 已确认退化为双轮长期接地并依靠轮速滚动/差速转向，不是合格的 Foot 步态模型。复现实验时建议用 `--checkpoint` 明确指定待测版本，并结合轮端净空与接触时序判断，不要只看是否存活；详见 `agent_docs/temp/foot_failure_2026-09-15/report.md`。
+
+Foot 未显式指定的步态参数会读取 checkpoint 同目录下 `params/env.yaml` 的 `commands.gait_command.ranges`，固定范围取固定值，其余范围取中点。当前 Foot 模型因此使用 `(frequency, offset, duration, swing_height) = (1.7, 0.5, 0.5, 0.0)`；缺少配置文件时也回退到这组 Foot 默认值，并在终端提示。启动日志会打印最终的 `gait=(...)`，当前观测、历史观测和重置均使用这组参数。命令行 `--gait-frequency`、`--gait-offset`、`--gait-duration`、`--swing-height` 可逐项覆盖。Wheel 默认仍为 `(1.7, 0.5, 0.525, 0.14)`。
+
+2026-09-15 起新 Foot 训练启用连续相位：`params/env.yaml` 中 `commands.gait_command.continuous_phase=true`。MuJoCo 自动按保存的标志选择时钟，启动打印 `gait_clock=continuous|legacy`。连续时钟只在策略实际出动作后推进一次，改频率保持当前相位，reset 清零；历史观测和当前观测共用相位。旧快照没有该字段时使用原有 `time×frequency` 公式。部署新模型时应同时保留 `params/env.yaml`，否则无法识别新时钟。
+
+2026-09-09 修正了策略角速度输入与实时速度曲线的坐标系：现在从 MuJoCo 读取世界系质心速度，再旋转到 `base_Link` 坐标系，与 Isaac Lab 一致。此前 `mjOBJ_BODY` 的局部速度使用惯性主轴坐标系；本模型的惯性主轴相对机身约旋转 27°，会混合 roll/yaw 角速度，导致 Foot 策略快速失稳。该修正不改变网络权重。平地短时对照已验证倒地现象改善，行走跟踪和全地形能力仍需单独评估。
+
+2026-09-10 补充修正了状态读取时机和扫描未命中编码：策略、地形扫描、实时曲线及画面读取机身状态前会刷新运动学缓存，使其对应当前 `qpos/qvel`；刷新不推进仿真时间，也不重新求解动力学。扫描未命中时的网络输入改为 `0`，与训练的裁剪结果一致，无效点仍不参与地形平面拟合。训练侧同时修正了高度目标采样的张量写回，后续启动的训练会恢复连续高度目标采样；已有模型的训练数据分布不会因此改变。
+
+Foot 模式始终将轮速参考固定为 0，由 PI 闭环制动；策略最后两维保留以兼容网络形状，但不影响轮速目标。训练保留实际轮速惩罚，删除轮速参考惩罚。Wheel 模式继续使用策略轮速目标。旧 checkpoint 在这个新控制语义下的表现不等同于原控制器表现。
+
+轮速使用带 anti-windup 的 PI 控制，默认为 `Kp=2.0 N·m/(rad/s)`、`Ki=0.5 N·m/rad`。可用 `--wheel-kp` 和 `--wheel-ki` 分别调整，Wheel 和 Foot 模式都生效。`--wheel-kv` 作为 `--wheel-kp` 的兼容别名保留。例如：
+
+```bash
+/home/tuchuaan/miniconda3/envs/UDMMR/bin/python mujoco/deploy_wheel_policy.py \
+  --mode wheel \
+  --wheel-kp 2.0 \
+  --wheel-ki 0.5
+```
+
+对应轮力矩为 `tau = Kp * error + Ki * integral(error)`，积分在 `200 Hz` 物理控制循环中更新。轮力矩限制为 `±80 N·m`；当力矩已饱和且误差仍继续推向饱和方向时停止积分，按 `R` 重置机器人时积分清零。`--wheel-ki 0` 可退化为纯 P 控制。Foot 模式使用策略目标，但额外执行 `±1 rad/s` 安全裁剪。
+
+部署侧纯 Python 回归测试使用同时包含 `mujoco` 和 `glfw` 的 UDMMR 环境：
+
+```bash
+cd /home/tuchuaan/tron1-rl-isaaclab/tests
+/home/tuchuaan/miniconda3/envs/UDMMR/bin/python -m unittest \
+  test_mujoco_gait_command test_mujoco_height_scan test_mujoco_velocity_frame
+```
+
+截至 2026-09-15 共 `19` 个测试，覆盖 checkpoint gait 参数读取、连续/legacy 相位推进、扫描未命中编码、运动学刷新和 `base_Link` 速度坐标变换；这些测试不打开窗口，也不代替实际地形行为验收。
 
 启动时会在终端选择地形类型、等级或综合地形号码。窗口按键与 UDMMR 的键盘仿真保持同一套运动语义：
 
@@ -88,3 +119,12 @@ tensorboard \
 ```
 
 然后在浏览器打开 `http://localhost:6006`。若从另一台电脑访问训练机，增加 `--bind_all`，并访问 `http://训练机IP:6006`。
+
+
+### Foot 落脚区域预览
+
+测试命令添加 `--show-footholds`：青色/橙色椭圆为左右脚目标区域，绿/红点为最近有效落点在区域内/外。读取 checkpoint 保存的参数；旧模型没有参数时明确提示使用当前默认值，仅作目标预览，不改变旧策略行为。详细算法和范围见 [v9 说明](../agent_docs/human/wf_foot_foothold_v9.md)。
+
+### v12 零命令保持观测
+
+Foot/Wheel 新模型 policy 为 161D（Actor 总输入 168D），末尾追加 x/y/yaw 保持误差及三个启用标记；保持 tracker 与训练共用，R 重置清空状态。必须保留同一 run 的 `params/env.yaml`。旧 155D policy 继续按旧结构加载，不会自动获得保持观测。历史仍为 34×10；详细时序与从头训练说明见 [v12 文档](../agent_docs/human/wf_hold_observation_v12.md)。

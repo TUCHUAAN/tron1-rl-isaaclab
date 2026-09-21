@@ -6,6 +6,7 @@ specify the reward function and its parameters.
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import torch
 from torch import distributions
@@ -17,6 +18,12 @@ from isaaclab.sensors import ContactSensor, RayCaster
 import isaaclab.utils.math as math_utils
 
 from .reward_math import (
+    GaitCycleIntegral,
+    FootholdRegionTracker,
+    MissedSwingTracker,
+    ZeroCommandHoldTracker,
+    terrain_obstacle_relief,
+    gait_contact_targets,
     all_support_confidence,
     any_support_confidence,
     base_height_plane_error_l2,
@@ -30,12 +37,18 @@ from .reward_math import (
     height_command_transition_scale,
     horizontal_neutral_penalty,
     landing_impact_l2,
+    lateral_foot_width_penalty,
     mean_support_confidence,
+    phase_swing_clearance_exp,
+    swing_min_clearance_shortfall,
     rolling_contact_slip_l2,
     terrain_relative_feet_regulation,
     terrain_relative_landing_velocity_l2,
     terrain_orientation_penalty,
+    terrain_swing_peak_height,
     wheel_clearance_confidence,
+    wheel_speed_huber,
+    wheel_target_deadband_l2,
     wheel_target_symmetry_penalty,
     zero_command_yaw_rate_penalty,
     zero_command_wheel_target_penalty,
@@ -95,7 +108,9 @@ def joint_powers_l1(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEnt
 
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
-    return torch.sum(torch.abs(torch.mul(asset.data.applied_torque, asset.data.joint_vel)), dim=1)
+    return torch.sum(torch.abs(
+        asset.data.applied_torque[:, asset_cfg.joint_ids] * asset.data.joint_vel[:, asset_cfg.joint_ids]
+    ), dim=1)
 
 
 def lin_vel_z_height_command_gated_l2(
@@ -189,6 +204,24 @@ def feet_distance(env: ManagerBasedRLEnv,
     reward = torch.clip(min_feet_distance - feet_distance, 0, 1)
     reward += torch.clip(feet_distance - max_feet_distance, 0, 1)
     return reward
+
+def foot_lateral_width_huber(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    min_width: float = 0.30,
+    max_width: float = 0.38,
+    error_scale: float = 0.05,
+) -> torch.Tensor:
+    """Constrain left/right wheel-center width without restricting step length."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return lateral_foot_width_penalty(
+        asset.data.body_link_pos_w[:, asset_cfg.body_ids],
+        asset.data.root_link_quat_w,
+        min_width,
+        max_width,
+        error_scale,
+    )
+
 
 def nominal_foot_position(env: ManagerBasedRLEnv, command_name: str,
                           base_height_target: float,
@@ -430,6 +463,14 @@ class GaitReward(ManagerTermBase):
         self.force_scale = float(cfg.params["tracking_contacts_shaped_force"])
         self.vel_scale = float(cfg.params["tracking_contacts_shaped_vel"])
         self.force_sigma = cfg.params["gait_force_sigma"]
+        self.force_kernel = cfg.params.get("force_kernel", "exponential")
+        self.force_reference = float(cfg.params.get("force_reference", 100.0))
+        if self.force_kernel not in ("exponential", "huber"):
+            raise ValueError("force_kernel must be exponential or huber.")
+        if not math.isfinite(self.force_reference) or self.force_reference <= 0.0:
+            raise ValueError("force_reference must be finite and positive (N).")
+        if self.force_kernel == "huber" and self.force_scale >= 0.0:
+            raise ValueError("Huber gait unloading requires a negative tracking_contacts_shaped_force.")
         self.vel_sigma = cfg.params["gait_vel_sigma"]
         self.kappa_gait_probs = cfg.params["kappa_gait_probs"]
         self.command_name = cfg.params["command_name"]
@@ -446,6 +487,8 @@ class GaitReward(ManagerTermBase):
         command_name,
         sensor_cfg,
         asset_cfg,
+        force_kernel="exponential",
+        force_reference=100.0,
     ) -> torch.Tensor:
         """Compute the reward.
 
@@ -476,52 +519,24 @@ class GaitReward(ManagerTermBase):
         return total_reward
 
     def compute_contact_targets(self, gait_params):
-        """Calculate desired contact states for the current timestep."""
-        frequencies = gait_params[:, 0]
-        offsets = gait_params[:, 1]
-        durations = torch.cat(
-            [
-                gait_params[:, 2].view(self.num_envs, 1),
-                gait_params[:, 2].view(self.num_envs, 1),
-            ],
-            dim=1,
+        return gait_contact_targets(
+            self._env.command_manager.get_term(self.command_name).phase,
+            gait_params[:, 1], gait_params[:, 2], self.kappa_gait_probs,
         )
-
-        assert torch.all(frequencies > 0), "Frequencies must be positive"
-        assert torch.all((offsets >= 0) & (offsets <= 1)), "Offsets must be between 0 and 1"
-        assert torch.all((durations > 0) & (durations < 1)), "Durations must be between 0 and 1"
-
-        gait_indices = torch.remainder(self._env.episode_length_buf * self.dt * frequencies, 1.0)
-
-        # Calculate foot indices
-        foot_indices = torch.remainder(
-            torch.cat(
-                [gait_indices.view(self.num_envs, 1), (gait_indices + offsets + 1).view(self.num_envs, 1)],
-                dim=1,
-            ),
-            1.0,
-        )
-
-        # Determine stance and swing phases
-        stance_idxs = foot_indices < durations
-        swing_idxs = foot_indices > durations
-
-        # Adjust foot indices based on phase
-        foot_indices[stance_idxs] = torch.remainder(foot_indices[stance_idxs], 1) * (0.5 / durations[stance_idxs])
-        foot_indices[swing_idxs] = 0.5 + (torch.remainder(foot_indices[swing_idxs], 1) - durations[swing_idxs]) * (
-            0.5 / (1 - durations[swing_idxs])
-        )
-
-        # Calculate desired contact states using von mises distribution
-        smoothing_cdf_start = distributions.normal.Normal(0, self.kappa_gait_probs).cdf
-        desired_contact_states = smoothing_cdf_start(foot_indices) * (
-            1 - smoothing_cdf_start(foot_indices - 0.5)
-        ) + smoothing_cdf_start(foot_indices - 1) * (1 - smoothing_cdf_start(foot_indices - 1.5))
-
-        return desired_contact_states
 
     def _compute_force_reward(self, forces: torch.Tensor, desired_contacts: torch.Tensor) -> torch.Tensor:
         """Compute force-based reward component."""
+        if self.force_kernel == "huber":
+            # Foot: distinguish partial unloading at normal stance loads.
+            # Planned stance force is not penalized; the opposite foot may
+            # take the load. Actual lift height is handled by clearance.
+            normalized_force = forces.abs() / self.force_reference
+            cost = torch.where(
+                normalized_force <= 1.0,
+                0.5 * normalized_force.square(),
+                normalized_force - 0.5,
+            )
+            return self.force_scale * ((1.0 - desired_contacts) * cost).mean(dim=1)
         reward = torch.zeros_like(forces[:, 0])
         if self.force_scale < 0:  # Negative scale means penalize unwanted contact
             for i in range(forces.shape[1]):
@@ -545,6 +560,25 @@ class GaitReward(ManagerTermBase):
         return (reward / velocities.shape[1]) * self.vel_scale
 
 
+def leg_action_rate_l2(env: ManagerBasedRLEnv, action_dim: int = 6) -> torch.Tensor:
+    """Foot leg action changes only; ignored wheel outputs do not incur cost."""
+    return (env.action_manager.action[:, :action_dim] -
+            env.action_manager.prev_action[:, :action_dim]).square().sum(1)
+
+
+def planned_support_contact_loss(
+    env: ManagerBasedRLEnv, command_name: str,
+    contact_sensor_names: tuple[str, str], kappa_gait_probs: float = 0.05,
+    force_off: float = 5.0, force_on: float = 10.0,
+) -> torch.Tensor:
+    """Require the planned stance wheel to maintain ground support in all modes."""
+    gait = env.command_manager.get_command(command_name)
+    phase = env.command_manager.get_term(command_name).phase
+    planned = gait_contact_targets(phase, gait[:, 1], gait[:, 2], kappa_gait_probs)
+    actual = _wheel_ground_force_confidence(env, contact_sensor_names, force_off, force_on)
+    return (planned * (1. - actual).square()).mean(1)
+
+
 class ActionSmoothnessPenalty(ManagerTermBase):
     """
     A reward term for penalizing large instantaneous changes in the network action output.
@@ -564,7 +598,7 @@ class ActionSmoothnessPenalty(ManagerTermBase):
         self.prev_action = None
         # self.__name__ = "action_smoothness_penalty"
 
-    def __call__(self, env: ManagerBasedRLEnv) -> torch.Tensor:
+    def __call__(self, env: ManagerBasedRLEnv, action_dim: int | None = None) -> torch.Tensor:
         """Compute the action smoothness penalty.
 
         Args:
@@ -574,7 +608,7 @@ class ActionSmoothnessPenalty(ManagerTermBase):
             The penalty value based on the action smoothness.
         """
         # Get the current action from the environment's action manager
-        current_action = env.action_manager.action.clone()
+        current_action = env.action_manager.action[:, :action_dim].clone()
 
         # If this is the first call, initialize the previous actions
         if self.prev_action is None:
@@ -601,8 +635,99 @@ class ActionSmoothnessPenalty(ManagerTermBase):
         return penalty
 
 
+class GaitCycleMeanTrackingPenalty(ManagerTermBase):
+    """Signed tracking error averaged over one complete sliding gait cycle."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        params = cfg.params
+        if params["component"] not in ("vx", "vy", "yaw", "height", "roll", "pitch"):
+            raise ValueError("Unknown cycle tracking component.")
+        scale = params["error_scale"]
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("Cycle mean error_scale must be finite and positive.")
+        gait = env.command_manager.get_term(params.get("gait_command_name", "gait_command"))
+        if not gait.cfg.continuous_phase:
+            raise ValueError("Cycle mean tracking requires the continuous gait clock.")
+        f_min, f_max = gait.cfg.ranges.frequencies
+        if not (math.isfinite(f_min) and math.isfinite(f_max)
+                and 0.0 < f_min <= f_max and f_max * env.step_dt < 1.0):
+            raise ValueError("Expected positive gait frequencies below one cycle per control step.")
+        capacity = math.ceil(1.0 / (f_min * env.step_dt)) + 2
+        self.window = GaitCycleIntegral(env.num_envs, capacity, env.device)
+        self._previous_phase = torch.zeros(env.num_envs, device=env.device)
+        self._previous_heading = torch.zeros_like(self._previous_phase)
+        self._initialized = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        self._cost = torch.zeros_like(self._previous_phase)
+        self._last_step = None
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self.window.reset(ids)
+        self._initialized[ids] = False
+        self._previous_phase[ids] = 0.0
+        self._previous_heading[ids] = 0.0
+        self._cost[ids] = 0.0
+
+    def __call__(
+        self, env, command_name: str, component: str, error_scale: float,
+        asset_cfg: SceneEntityCfg, gait_command_name: str = "gait_command",
+        height_command_name: str = "body_height",
+        sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    ) -> torch.Tensor:
+        step = env.common_step_counter
+        if step == self._last_step:
+            return self._cost
+        if self._last_step is not None and step != self._last_step + 1:
+            self.reset()
+        self._last_step = step
+        phase = env.command_manager.get_term(gait_command_name).phase
+        phase_span = torch.remainder(phase - self._previous_phase, 1.0)
+        asset = env.scene[asset_cfg.name]
+        command = env.command_manager.get_command(command_name)
+        valid = torch.isfinite(phase)
+        if component in ("vx", "vy"):
+            index = 0 if component == "vx" else 1
+            increment = (asset.data.root_lin_vel_b[:, index] - command[:, index]) * env.step_dt
+        elif component == "yaw":
+            qw, qx, qy, qz = asset.data.root_link_quat_w.unbind(-1)
+            x = 1.0 - 2.0 * (qy.square() + qz.square())
+            y = 2.0 * (qx * qy + qw * qz)
+            heading = torch.atan2(y, x)
+            delta = heading - self._previous_heading
+            increment = torch.atan2(torch.sin(delta), torch.cos(delta)) - command[:, 2] * env.step_dt
+            self._previous_heading[:] = heading
+            valid = valid & torch.isfinite(heading) & (x.square() + y.square() > 1.e-8)
+        else:
+            centroid, normal, plane_valid = _terrain_plane(env.scene.sensors[sensor_cfg.name])
+            valid = valid & plane_valid
+            if component == "height":
+                actual = ((asset.data.root_link_pos_w - centroid) * normal).sum(-1)
+                error = actual - env.command_manager.get_command(height_command_name)[:, 0]
+            else:
+                # Signed tilt relative to the local terrain normal; no independent
+                # roll/pitch command exists in this task. Both vanish when aligned.
+                normal_b = math_utils.quat_apply_inverse(asset.data.root_link_quat_w, normal)
+                nx, ny, nz = normal_b.unbind(-1)
+                error = (torch.atan2(ny, nz) if component == "roll" else
+                         torch.atan2(-nx, torch.sqrt(ny.square() + nz.square())))
+            increment = error * env.step_dt
+        valid = valid & torch.isfinite(increment)
+        integral = self.window.update(increment, phase_span, valid & self._initialized, env.step_dt)
+        mean_error = integral / self.window.duration.clamp_min(1.e-8)
+        error = mean_error.abs() / error_scale
+        self._cost[:] = torch.where(error <= 1.0, 0.5 * error.square(), error - 0.5)
+        self._previous_phase[:] = phase
+        self._initialized[:] = valid
+        return self._cost
+
+
 class BaseVelocityAccelerationPenalty(ManagerTermBase):
-    """Weak, bounded Wheel base-acceleration penalty with tracking and support gates."""
+    """Base velocity-change penalty with configurable tracking and support gates.
+
+    Defaults preserve Wheel behavior. Foot XY uses world-frame differences so
+    rotation of the base frame alone cannot be mistaken for acceleration.
+    """
 
     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
@@ -631,12 +756,23 @@ class BaseVelocityAccelerationPenalty(ManagerTermBase):
         force_on: float = 10.0,
         geometry_tolerance_on: float = 0.02,
         geometry_tolerance_off: float = 0.035,
+        linear_velocity_frame: str = "body",
+        min_tracking_gate: float = 0.0,
     ) -> torch.Tensor:
         asset: Articulation = env.scene[asset_cfg.name]
         command = env.command_manager.get_command(command_name)
+        if linear_velocity_frame not in ("body", "world"):
+            raise ValueError("linear_velocity_frame must be 'body' or 'world'.")
         if component == "xy":
-            current_velocity = asset.data.root_lin_vel_b[:, :2]
-            tracking_error_squared = torch.sum(torch.square(command[:, :2] - current_velocity), dim=1)
+            # Commands are body-frame velocities even when acceleration is
+            # evaluated in world coordinates.
+            tracking_error_squared = torch.sum(
+                torch.square(command[:, :2] - asset.data.root_lin_vel_b[:, :2]), dim=1
+            )
+            current_velocity = (
+                asset.data.root_lin_vel_w[:, :2] if linear_velocity_frame == "world"
+                else asset.data.root_lin_vel_b[:, :2]
+            )
         elif component == "yaw":
             current_velocity = asset.data.root_ang_vel_b[:, 2:3]
             tracking_error_squared = torch.square(command[:, 2] - current_velocity[:, 0])
@@ -666,6 +802,7 @@ class BaseVelocityAccelerationPenalty(ManagerTermBase):
                 support_confidence,
                 acceleration_scale=acceleration_scale,
                 tracking_std=tracking_std,
+                min_tracking_gate=min_tracking_gate,
             )
         elif kernel == "charbonnier":
             penalty = charbonnier_acceleration_tracking_penalty(
@@ -674,6 +811,7 @@ class BaseVelocityAccelerationPenalty(ManagerTermBase):
                 support_confidence,
                 acceleration_scale=acceleration_scale,
                 tracking_std=tracking_std,
+                min_tracking_gate=min_tracking_gate,
             )
         else:
             raise ValueError(f"kernel must be 'bounded' or 'charbonnier', got {kernel!r}.")
@@ -922,6 +1060,249 @@ def wheel_terrain_feet_regulation(
     )
 
 
+def lin_vel_xy_tracking_error_huber(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    error_scale: float = 0.4,
+) -> torch.Tensor:
+    """Instantaneous body-frame planar tracking cost with a linear large-error tail."""
+    if not math.isfinite(error_scale) or error_scale <= 0.0:
+        raise ValueError("error_scale must be finite and positive.")
+    command = env.command_manager.get_command(command_name)[:, :2]
+    actual = env.scene[asset_cfg.name].data.root_lin_vel_b[:, :2]
+    error = torch.linalg.vector_norm(command - actual, dim=1) / error_scale
+    return torch.where(error <= 1.0, 0.5 * error.square(), error - 0.5)
+
+
+def ang_vel_z_tracking_error_huber(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg,
+    error_scale: float = 0.5,
+) -> torch.Tensor:
+    """Retain a yaw tracking cost beyond the narrow exponential reward kernel."""
+    if error_scale <= 0.0:
+        raise ValueError("error_scale must be positive.")
+    command = env.command_manager.get_command(command_name)[:, 2]
+    actual = env.scene[asset_cfg.name].data.root_ang_vel_b[:, 2]
+    error = (command - actual).abs() / error_scale
+    return torch.where(error <= 1.0, 0.5 * error.square(), error - 0.5)
+
+
+class TerrainAdaptiveSwingClearanceExp(ManagerTermBase):
+    """Always-active exponential Foot swing reward driven by the full terrain scan's Z range.
+
+    The peak follows live scans with fast rise and slower decay. It is not
+    latched at takeoff, controlled by body height, or gated by speed commands.
+    Local wheel planes still define each wheel's measured rim clearance.
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._min_peak_height = float(cfg.params.get("min_peak_height", 0.04))
+        self.peak_height = torch.full((env.num_envs,), self._min_peak_height, device=env.device)
+        self.raw_peak_height = self.peak_height.clone()
+        self.scan_valid = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self._initialized = torch.zeros_like(self.scan_valid)
+
+    def reset(self, env_ids=None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        self.peak_height[env_ids] = self._min_peak_height
+        self.raw_peak_height[env_ids] = self._min_peak_height
+        self.scan_valid[env_ids] = False
+        self._initialized[env_ids] = False
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        asset_cfg: SceneEntityCfg,
+        contact_sensor_names: tuple[str, str],
+        terrain_sensor_names: tuple[str, str],
+        height_sensor_cfg: SceneEntityCfg,
+        gait_command_name: str = "gait_command",
+        wheel_radius: float = 0.128,
+        min_peak_height: float = 0.04,
+        max_peak_height: float = 0.10,
+        rise_time_constant: float = 0.04,
+        fall_time_constant: float = 0.15,
+        std: float = 0.025,
+        force_off: float = 5.0,
+        force_on: float = 10.0,
+        geometry_tolerance_on: float = 0.02,
+        geometry_tolerance_off: float = 0.06,
+    ) -> torch.Tensor:
+        if rise_time_constant <= 0.0 or fall_time_constant <= 0.0:
+            raise ValueError("Swing height filter time constants must be positive.")
+        hits = env.scene.sensors[height_sensor_cfg.name].data.ray_hits_w
+        raw_peak, scan_valid = terrain_swing_peak_height(hits, min_peak_height, max_peak_height)
+        alpha = torch.where(
+            raw_peak > self.peak_height,
+            1.0 - math.exp(-env.step_dt / rise_time_constant),
+            1.0 - math.exp(-env.step_dt / fall_time_constant),
+        )
+        filtered = self.peak_height + alpha * (raw_peak - self.peak_height)
+        # The first valid scan initializes without inheriting another episode's
+        # terrain. Missing scans hold state, but do not score clearance.
+        filtered = torch.where(self._initialized, filtered, raw_peak)
+        self.peak_height[:] = torch.where(scan_valid, filtered, self.peak_height).clamp(
+            min_peak_height, max_peak_height
+        )
+        self.raw_peak_height[:] = raw_peak
+        self.scan_valid[:] = scan_valid
+        self._initialized |= scan_valid
+
+        asset: Articulation = env.scene[asset_cfg.name]
+        positions = asset.data.body_link_pos_w[:, asset_cfg.body_ids]
+        centroids, normals, valid = _wheel_terrain_planes(env, terrain_sensor_names)
+        clearance = torch.sum((positions - centroids) * normals, dim=-1) - wheel_radius
+        force = _wheel_ground_force_confidence(env, contact_sensor_names, force_off, force_on)
+        geometry = wheel_clearance_confidence(
+            positions, centroids, normals, valid,
+            wheel_radius=wheel_radius,
+            tolerance_on=geometry_tolerance_on,
+            tolerance_off=geometry_tolerance_off,
+        )
+        gait = env.command_manager.get_command(gait_command_name)
+        phase = env.command_manager.get_term(gait_command_name).phase
+        foot_phase = torch.stack((phase, torch.remainder(phase + gait[:, 1], 1.0)), dim=1)
+        return phase_swing_clearance_exp(
+            clearance, foot_phase, gait[:, 2], force * geometry,
+            valid & scan_valid.unsqueeze(1), self.peak_height,
+            std=std,
+        )
+
+
+class FootholdRegionPenalty(ManagerTermBase):
+    """Event cost for landing outside a frozen, direction-aware foothold ellipse."""
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.tracker = FootholdRegionTracker(env.num_envs, env.device, **cfg.params.get("tracker_options", {}))
+        self._last_step = None
+        self._cost = torch.zeros(env.num_envs, device=env.device)
+
+    def reset(self, env_ids=None):
+        self.tracker.reset(env_ids)
+        self._cost[slice(None) if env_ids is None else env_ids] = 0.
+
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg,
+                 contact_sensor_names: tuple[str,str], terrain_sensor_names: tuple[str,str],
+                 height_sensor_cfg: SceneEntityCfg, command_name: str = "base_velocity",
+                 gait_command_name: str = "gait_command", tracker_options: dict | None = None):
+        step = env.common_step_counter
+        if step == self._last_step:
+            return self._cost
+        if self._last_step is not None and step != self._last_step + 1:
+            self.reset()
+        self._last_step = step
+        asset = env.scene[asset_cfg.name]
+        positions = asset.data.body_link_pos_w[:, asset_cfg.body_ids]
+        quat = asset.data.root_link_quat_w
+        qw,qx,qy,qz = quat.unbind(-1)
+        heading = torch.atan2(2.*(qx*qy+qw*qz), 1.-2.*(qy.square()+qz.square()))
+        centroid, normal, valid = _wheel_terrain_planes(env, terrain_sensor_names)
+        radius = self.tracker.plan_options.get("wheel_radius", .128)
+        clearance = ((positions-centroid)*normal).sum(-1)-radius
+        clearance = torch.where(valid, clearance, torch.nan)
+        forces = []
+        for name in contact_sensor_names:
+            matrix = env.scene.sensors[name].data.force_matrix_w
+            if matrix is None:
+                raise RuntimeError("Foothold events require current terrain-filtered wheel forces.")
+            forces.append(torch.linalg.vector_norm(matrix.sum(2)[:,0], dim=-1))
+        event_cost = self.tracker.update(
+            asset.data.root_link_pos_w, heading, asset.data.root_lin_vel_b,
+            env.command_manager.get_command(command_name),
+            env.command_manager.get_command(gait_command_name),
+            env.command_manager.get_term(gait_command_name).phase,
+            env.scene.sensors[height_sensor_cfg.name].data.ray_hits_w,
+            positions, torch.stack(forces, dim=1), clearance, env.step_dt,
+        )
+        # A landing is a discrete event: RewardManager multiplies by dt, so
+        # cancel that multiplier to keep the configured cost per landing fixed.
+        self._cost[:] = event_cost / env.step_dt
+        return self._cost
+
+
+class TerrainCycleSwingClearanceExp(ManagerTermBase):
+    """Select a 5/10 cm peak once per full cycle; score a live cycloidal height."""
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.low = float(cfg.params.get("min_peak_height", .05))
+        self.high = float(cfg.params.get("max_peak_height", .10))
+        center = float(cfg.params.get("switch_center", .04))
+        band = float(cfg.params.get("switch_band", .01))
+        if not all(math.isfinite(v) for v in (self.low, self.high, center, band)) or not (
+            0. < self.low < self.high and 0. < band < 2. * center
+        ):
+            raise ValueError("Invalid two-level swing heights or switch hysteresis.")
+        self.peak_height = torch.full((env.num_envs,), self.low, device=env.device)
+        self.raw_peak_height = self.peak_height.clone()
+        self.terrain_metric_m = torch.zeros_like(self.peak_height)
+        self.scan_valid = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        self._initialized = torch.zeros_like(self.scan_valid)
+        self._previous_phase = torch.zeros_like(self.peak_height)
+
+    def reset(self, env_ids=None):
+        ids = slice(None) if env_ids is None else env_ids
+        self.peak_height[ids] = self.low
+        self.raw_peak_height[ids] = self.low
+        self.terrain_metric_m[ids] = 0.
+        self.scan_valid[ids] = False
+        self._initialized[ids] = False
+        self._previous_phase[ids] = 0.
+
+    def __call__(
+        self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg,
+        contact_sensor_names: tuple[str, str], terrain_sensor_names: tuple[str, str],
+        height_sensor_cfg: SceneEntityCfg, gait_command_name: str = "gait_command",
+        wheel_radius: float = .128, min_peak_height: float = .05,
+        max_peak_height: float = .10, switch_center: float = .04,
+        switch_band: float = .01, std: float = .025,
+        force_off: float = 5., force_on: float = 10.,
+        geometry_tolerance_on: float = .02, geometry_tolerance_off: float = .06,
+    ) -> torch.Tensor:
+        gait = env.command_manager.get_command(gait_command_name)
+        phase = env.command_manager.get_term(gait_command_name).phase
+        update = (~self._initialized) | (phase < self._previous_phase)
+        # Only selected environments' scans are fitted, once at reset/phase wrap.
+        hits = env.scene.sensors[height_sensor_cfg.name].data.ray_hits_w[update]
+        relief, valid = terrain_obstacle_relief(hits)
+        previous_high = self.peak_height[update] > (min_peak_height + max_peak_height) / 2.
+        high = torch.where(
+            self._initialized[update],
+            torch.where(previous_high, relief >= switch_center - switch_band / 2.,
+                        relief > switch_center + switch_band / 2.),
+            relief > switch_center,
+        )
+        selected = torch.where(high, max_peak_height, min_peak_height)
+        # Invalid scans keep the last selected peak, but disable the height reward
+        # for this cycle. A fresh episode starts at the low peak.
+        self.peak_height[update] = torch.where(valid, selected, self.peak_height[update])
+        self.raw_peak_height[update] = self.peak_height[update]
+        self.terrain_metric_m[update] = relief
+        self.scan_valid[update] = valid
+        self._initialized[:] = True
+        self._previous_phase[:] = phase
+        asset = env.scene[asset_cfg.name]
+        positions = asset.data.body_link_pos_w[:, asset_cfg.body_ids]
+        centroids, normals, valid = _wheel_terrain_planes(env, terrain_sensor_names)
+        clearance = ((positions - centroids) * normals).sum(-1) - wheel_radius
+        force = _wheel_ground_force_confidence(env, contact_sensor_names, force_off, force_on)
+        geometry = wheel_clearance_confidence(
+            positions, centroids, normals, valid, wheel_radius=wheel_radius,
+            tolerance_on=geometry_tolerance_on, tolerance_off=geometry_tolerance_off,
+        )
+        foot_phase = torch.stack((phase, torch.remainder(phase + gait[:, 1], 1.)), dim=1)
+        # H*sin²(pi*u) == H/2*(1-cos(2*pi*u)): same cycloidal vertical profile.
+        return phase_swing_clearance_exp(
+            clearance, foot_phase, gait[:, 2], force * geometry,
+            valid & self.scan_valid[:, None], self.peak_height, std=std,
+        )
+
+
 def wheel_terrain_landing_velocity_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -930,6 +1311,7 @@ def wheel_terrain_landing_velocity_l2(
     wheel_radius: float = 0.128,
     about_landing_threshold: float = 0.08,
     contact_force_threshold: float = 0.1,
+    allowed_downward_speed: float = 0.0,
 ) -> torch.Tensor:
     """Apply the PF pre-contact landing-velocity objective along local terrain normals."""
     asset: Articulation = env.scene[asset_cfg.name]
@@ -948,6 +1330,7 @@ def wheel_terrain_landing_velocity_l2(
         in_contact,
         foot_radius=wheel_radius,
         about_landing_threshold=about_landing_threshold,
+        allowed_downward_speed=allowed_downward_speed,
     )
 
 
@@ -1171,6 +1554,27 @@ def all_wheels_air_time_l2(
     return torch.square(torch.clamp(simultaneous_air_time, min=0.0, max=max_air_time))
 
 
+def wheel_actual_speed_huber(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    speed_scale: float = 1.0,
+) -> torch.Tensor:
+    """Penalize actual wheel speed in every contact state."""
+    asset: Articulation = env.scene[asset_cfg.name]
+    wheel_velocity = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return wheel_speed_huber(wheel_velocity, speed_scale=speed_scale)
+
+
+def wheel_target_zero_deadband_l2(
+    env: ManagerBasedRLEnv,
+    action_name: str,
+    target_deadband: float = 0.1,
+) -> torch.Tensor:
+    """Penalize learned wheel-speed targets outside a small braking deadband."""
+    wheel_targets = env.action_manager.get_term(action_name).processed_actions
+    return wheel_target_deadband_l2(wheel_targets, target_deadband=target_deadband)
+
+
 def wheel_rolling_velocity_error(
     env: ManagerBasedRLEnv,
     radius: float,
@@ -1380,3 +1784,100 @@ def wheel_swing_height_tracking(
     error = torch.square(wheel_height - commanded_height) * swing_mask.float()
     active_feet = torch.clamp(torch.sum(swing_mask.float(), dim=1), min=1.0)
     return torch.sum(error, dim=1) / active_feet
+
+
+class ZeroCommandHoldPenalty(ManagerTermBase):
+    """Dense, bounded zero-command hold cost shared by Foot and Wheel."""
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.tracker = ZeroCommandHoldTracker(env.num_envs, env.device, env.step_dt,
+                                             **cfg.params.get('tracker_options', {}))
+        self._last_step = None
+        self._cost = torch.zeros(env.num_envs, device=env.device)
+
+    def reset(self, env_ids=None):
+        self.tracker.reset(env_ids)
+        self._cost[slice(None) if env_ids is None else env_ids] = 0.
+
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg,
+                 command_name: str = 'base_velocity', tracker_options: dict | None = None):
+        step = env.common_step_counter
+        if step == self._last_step:
+            return self._cost
+        if self._last_step is not None and step != self._last_step + 1:
+            self.reset()
+        self._last_step = step
+        asset = env.scene[asset_cfg.name]
+        qw, qx, qy, qz = asset.data.root_link_quat_w.unbind(-1)
+        yaw = torch.atan2(2.*(qx*qy+qw*qz), 1.-2.*(qy.square()+qz.square()))
+        self._cost[:] = self.tracker.update(asset.data.root_link_pos_w[:, :2], yaw,
+                                            env.command_manager.get_command(command_name)[:, :3])
+        return self._cost
+
+    def observe(self, env):
+        # Rewards run before command resampling in Isaac Lab. Advance the pose
+        # once for this physics step, then reconcile the new command without dt.
+        params = self.cfg.params
+        self(env, **params)
+        asset = env.scene[params['asset_cfg'].name]
+        qw, qx, qy, qz = asset.data.root_link_quat_w.unbind(-1)
+        yaw = torch.atan2(2.*(qx*qy+qw*qz), 1.-2.*(qy.square()+qz.square()))
+        self.tracker.prime(asset.data.root_link_pos_w[:, :2], yaw)
+        self.tracker.synchronize_command(env.command_manager.get_command(
+            params.get('command_name', 'base_velocity'))[:, :3])
+        return self.tracker.observation()
+
+
+class MissedSwingPenalty(ManagerTermBase):
+    """Per-foot failure cost per complete planned swing; cancel manager dt."""
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.tracker = MissedSwingTracker(env.num_envs, env.device, **cfg.params.get('tracker_options', {}))
+        self._last_step = None
+        self._cost = torch.zeros(env.num_envs, device=env.device)
+
+    def reset(self, env_ids=None):
+        self.tracker.reset(env_ids)
+        self._cost[slice(None) if env_ids is None else env_ids] = 0.
+
+    def __call__(self, env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg,
+                 contact_sensor_names: tuple[str, str], terrain_sensor_names: tuple[str, str],
+                 gait_command_name: str = 'gait_command', wheel_radius: float = .128,
+                 tracker_options: dict | None = None):
+        step = env.common_step_counter
+        if step == self._last_step:
+            return self._cost
+        if self._last_step is not None and step != self._last_step + 1:
+            self.reset()
+        self._last_step = step
+        centroid, normal, valid = _wheel_terrain_planes(env, terrain_sensor_names)
+        positions = env.scene[asset_cfg.name].data.body_link_pos_w[:, asset_cfg.body_ids]
+        clearance = ((positions-centroid)*normal).sum(-1)-wheel_radius
+        forces = []
+        for name in contact_sensor_names:
+            matrix = env.scene.sensors[name].data.force_matrix_w
+            if matrix is None:
+                raise RuntimeError('Missed swing detection requires terrain-filtered wheel forces.')
+            forces.append(torch.linalg.vector_norm(matrix.sum(2)[:, 0], dim=-1))
+        events = self.tracker.update(env.command_manager.get_term(gait_command_name).phase,
+            env.command_manager.get_command(gait_command_name), clearance,
+            torch.stack(forces, -1), valid, env.step_dt)
+        self._cost[:] = events/env.step_dt
+        return self._cost
+
+
+def swing_min_clearance_penalty(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg,
+    terrain_sensor_names: tuple[str, str], gait_command_name: str = 'gait_command',
+    wheel_radius: float = .128, min_clearance: float = .02,
+    active_start: float = .20, full_start: float = .35,
+) -> torch.Tensor:
+    """Continuous local-ground clearance requirement, independent for each foot."""
+    gait = env.command_manager.get_command(gait_command_name)
+    phase = env.command_manager.get_term(gait_command_name).phase
+    foot_phase = torch.stack((phase, torch.remainder(phase+gait[:, 1], 1.)), -1)
+    centroid, normal, valid = _wheel_terrain_planes(env, terrain_sensor_names)
+    positions = env.scene[asset_cfg.name].data.body_link_pos_w[:, asset_cfg.body_ids]
+    clearance = ((positions-centroid)*normal).sum(-1)-wheel_radius
+    return swing_min_clearance_shortfall(clearance, foot_phase, gait[:, 2], valid,
+                                         min_clearance, active_start, full_start)

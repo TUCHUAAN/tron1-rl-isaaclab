@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import re
@@ -17,6 +18,7 @@ import glfw
 import mujoco
 import numpy as np
 import torch
+import yaml
 from torch import nn
 
 
@@ -129,6 +131,37 @@ def _roll_pitch_degrees(rotation_wb: np.ndarray) -> tuple[float, float]:
     )
     roll = math.atan2(float(rotation_wb[2, 1]), float(rotation_wb[2, 2]))
     return math.degrees(roll), math.degrees(pitch)
+
+
+def _refresh_body_kinematics(model: mujoco.MjModel, data: mujoco.MjData) -> None:
+    """Refresh poses and COM velocities from qpos/qvel without solving dynamics.
+
+    mj_step integrates qpos/qvel after computing these derived quantities.
+    Refresh only the kinematic stages so observation queries do not advance
+    time or overwrite accelerations and the constraint solver's warm start.
+    """
+    mujoco.mj_kinematics(model, data)
+    mujoco.mj_comPos(model, data)
+    mujoco.mj_comVel(model, data)
+
+
+def _base_velocity_in_body_frame(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    base_body_id: int,
+    result: np.ndarray,
+) -> None:
+    """Write COM angular/linear velocity expressed in the base link's axes.
+
+    mjOBJ_BODY with flg_local=1 uses the principal inertia axes (ximat),
+    which can be rotated relative to the link frame used by Isaac Lab.
+    Keep the COM reference point and rotate world velocities with xmat.
+    """
+    _refresh_body_kinematics(model, data)
+    mujoco.mj_objectVelocity(model, data, mujoco.mjtObj.mjOBJ_BODY, base_body_id, result, 0)
+    rotation_wb = np.asarray(data.xmat[base_body_id]).reshape(3, 3)
+    result[:3] = rotation_wb.T @ result[:3]
+    result[3:] = rotation_wb.T @ result[3:]
 
 
 def _read_choice(label: str, minimum: int, maximum: int, default: int) -> int:
@@ -355,6 +388,64 @@ def checkpoint_body_height_range(checkpoint_path: Path) -> tuple[float, float]:
     return minimum, maximum
 
 
+def checkpoint_continuous_gait_phase(checkpoint_path: Path) -> bool:
+    """Read the clock convention saved with the model; older models use time*f."""
+    env_config = checkpoint_path.parent / "params" / "env.yaml"
+    if not env_config.is_file():
+        return False
+    try:
+        config = yaml.load(env_config.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+        value = config.get("commands", {}).get("gait_command", {}).get("continuous_phase", "false")
+    except (OSError, yaml.YAMLError, AttributeError) as error:
+        raise ValueError(f"无法读取 checkpoint 步态时钟配置：{env_config}") from error
+    if str(value).lower() not in ("true", "false"):
+        raise ValueError(f"continuous_phase 必须为 true/false，实际为 {value!r}")
+    return str(value).lower() == "true"
+
+
+def resolve_gait_command(args: argparse.Namespace, checkpoint_path: Path) -> np.ndarray:
+    """Resolve Foot defaults from its training snapshot, preserving CLI overrides."""
+    fields = (
+        ("gait_frequency", "frequencies"),
+        ("gait_offset", "offsets"),
+        ("gait_duration", "durations"),
+        ("swing_height", "swing_height"),
+    )
+    defaults = [1.7, 0.5, 0.5, 0.0] if args.mode == "foot" else [1.7, 0.5, 0.525, 0.14]
+    env_config = checkpoint_path.parent / "params" / "env.yaml"
+    use_snapshot = args.mode == "foot" and any(
+        getattr(args, field) is None for field, _ in fields
+    )
+    if use_snapshot and env_config.is_file():
+        try:
+            # BaseLoader reads Isaac Lab's Python-tagged YAML as plain data;
+            # loading gait ranges must not instantiate training classes.
+            config = yaml.load(env_config.read_text(encoding="utf-8"), Loader=yaml.BaseLoader)
+            ranges = config["commands"]["gait_command"]["ranges"]
+            for index, (field, range_name) in enumerate(fields):
+                if getattr(args, field) is not None:
+                    continue
+                bounds = ranges[range_name]
+                if not isinstance(bounds, list) or len(bounds) != 2:
+                    raise ValueError(f"{range_name} 必须包含两个边界值")
+                minimum, maximum = map(float, bounds)
+                if not math.isfinite(minimum) or not math.isfinite(maximum) or maximum < minimum:
+                    raise ValueError(f"{range_name} 范围无效：{bounds}")
+                defaults[index] = 0.5 * minimum + 0.5 * maximum
+        except (OSError, yaml.YAMLError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"无法读取 Foot checkpoint 的步态范围：{env_config}：{exc}") from exc
+    elif use_snapshot:
+        print("[gait] 未找到 params/env.yaml，使用 Foot 默认步态 (1.7, 0.5, 0.5, 0.0)。")
+
+    values = [
+        default if getattr(args, field) is None else getattr(args, field)
+        for (field, _), default in zip(fields, defaults)
+    ]
+    if not all(math.isfinite(value) for value in values) or values[0] <= 0.0:
+        raise ValueError("步态参数必须是有限数，且 gait frequency 必须大于 0。")
+    return np.asarray(values, dtype=np.float32)
+
+
 class TerrainHeightScanner:
     """Reproduce Isaac Lab's 1 m x 1 m yaw-attached 0.1 m height scan."""
 
@@ -371,8 +462,10 @@ class TerrainHeightScanner:
         self.last_plane_centroid = np.zeros(3, dtype=np.float64)
         self.last_plane_normal = np.asarray((0.0, 0.0, 1.0), dtype=np.float64)
         self.last_plane_valid = False
+        self.last_terrain_points = np.full((len(self.offsets), 3), np.nan)
 
     def scan(self, data: mujoco.MjData) -> np.ndarray:
+        _refresh_body_kinematics(self.model, data)
         base_position = np.asarray(data.xpos[self.base_body_id], dtype=np.float64)
         rotation = np.asarray(data.xmat[self.base_body_id], dtype=np.float64).reshape(3, 3)
         yaw = math.atan2(rotation[1, 0], rotation[0, 0])
@@ -395,7 +488,10 @@ class TerrainHeightScanner:
                 self.geom_id,
             )
             if distance < 0.0:
-                heights[index] = 10.0
+                # Isaac Lab encodes missing hits as +inf positions, so its
+                # clipped (sensor_z - hit_z - 0.5) observation becomes zero.
+                # Leave terrain_points invalid for the plane fit below.
+                heights[index] = 0.0
             else:
                 heights[index] = np.clip(distance - 0.5, 0.0, 10.0)
                 terrain_points[index] = ray_origin + distance * self.ray_direction
@@ -404,6 +500,7 @@ class TerrainHeightScanner:
             self.last_plane_normal,
             self.last_plane_valid,
         ) = _fit_height_plane_numpy(terrain_points)
+        self.last_terrain_points = terrain_points
         return heights
 
     def body_height(self, data: mujoco.MjData) -> float:
@@ -469,6 +566,26 @@ def _build_mlp(state_dict: dict[str, torch.Tensor], prefix: str) -> nn.Sequentia
     return network
 
 
+def _checkpoint_hold_tracker(checkpoint_path: Path):
+    """New 161D policies require the saved hold configuration; no guessed defaults."""
+    config_path = checkpoint_path.parent / "params" / "env.yaml"
+    if not config_path.is_file():
+        raise ValueError(f"零命令保持观测模型需要配置快照：{config_path}")
+    config = yaml.load(config_path.read_text(), Loader=yaml.BaseLoader)
+    observation = config.get('observations', {}).get('policy', {}).get('zero_command_hold')
+    if not isinstance(observation, dict) or not str(observation.get('func', '')).endswith('zero_command_hold_observation'):
+        raise ValueError('161D policy 缺少有效的 zero_command_hold 观测声明。')
+    reward = config.get('rewards', {}).get('pen_zero_command_hold')
+    if not isinstance(reward, dict) or not float(reward.get('weight', 0)):
+        raise ValueError('零命令保持观测需要启用 pen_zero_command_hold。')
+    options = {key: float(value) for key, value in reward.get('params', {}).get('tracker_options', {}).items()}
+    path = Path(__file__).resolve().parents[1] / 'exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/mdp/reward_math.py'
+    spec = importlib.util.spec_from_file_location('mujoco_zero_hold_math', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.ZeroCommandHoldTracker(1, 'cpu', POLICY_DT, **options)
+
+
 class WheelPolicy:
     """Checkpoint loader plus the exact actor and encoder observation schema."""
 
@@ -496,7 +613,14 @@ class WheelPolicy:
         encoder_output_dim = int(self.encoder[-1].out_features)
         actor_input_dim = int(self.actor[0].in_features)
         actor_output_dim = int(self.actor[-1].out_features)
-        expected_actor_input = encoder_output_dim + POLICY_OBS_DIM + COMMAND_DIM
+        self.policy_obs_dim = actor_input_dim - encoder_output_dim - COMMAND_DIM
+        if self.policy_obs_dim not in (POLICY_OBS_DIM, POLICY_OBS_DIM + 6):
+            raise ValueError(f"不支持的策略观测维度：{self.policy_obs_dim}，预期 155 或 161。")
+        self.hold_tracker = (_checkpoint_hold_tracker(checkpoint_path)
+                             if self.policy_obs_dim == POLICY_OBS_DIM + 6 else None)
+        self._hold_started = False
+        self._hold_previous_command = np.zeros(3, dtype=np.float32)
+        expected_actor_input = encoder_output_dim + self.policy_obs_dim + COMMAND_DIM
         if encoder_input_dim != HISTORY_LENGTH * HISTORY_OBS_DIM:
             raise ValueError(
                 f"encoder 输入维度为 {encoder_input_dim}，预期 "
@@ -534,27 +658,35 @@ class WheelPolicy:
         self.last_action = np.zeros(ACTION_DIM, dtype=np.float32)
         self.history: deque[np.ndarray] = deque(maxlen=HISTORY_LENGTH)
         self.policy_step = 0
+        self.continuous_gait_phase = checkpoint_continuous_gait_phase(checkpoint_path)
+        self._phase_cycles = 0.0
 
     def reset(self, data: mujoco.MjData, gait_command: np.ndarray) -> None:
         self.last_action.fill(0.0)
+        if getattr(self, 'hold_tracker', None) is not None:
+            self.hold_tracker.reset()
+            self._hold_started = False
+            self._hold_previous_command.fill(0.)
         self.policy_step = 0
+        self._phase_cycles = 0.0
         history_row = self._history_observation(data, gait_command)
         self.history.clear()
         self.history.extend(history_row.copy() for _ in range(HISTORY_LENGTH))
 
     def _gait_phase(self, frequency: float) -> np.ndarray:
-        phase = (self.policy_step * POLICY_DT * frequency) % 1.0
+        phase = (
+            self._phase_cycles if self.continuous_gait_phase
+            else (self.policy_step * POLICY_DT * frequency) % 1.0
+        )
         angle = 2.0 * math.pi * phase
         return np.asarray((math.sin(angle), math.cos(angle)), dtype=np.float32)
 
     def _common_observation(self, data: mujoco.MjData) -> np.ndarray:
-        mujoco.mj_objectVelocity(
+        _base_velocity_in_body_frame(
             self.model,
             data,
-            mujoco.mjtObj.mjOBJ_BODY,
             self.base_body_id,
             self.velocity_buffer,
-            1,
         )
         base_angular_velocity = np.clip(self.velocity_buffer[:3], -100.0, 100.0) * 0.25
         rotation = np.asarray(data.xmat[self.base_body_id], dtype=np.float64).reshape(3, 3)
@@ -593,6 +725,21 @@ class WheelPolicy:
             )
         return history_observation
 
+    def _hold_observation(self, data, command):
+        tracker = self.hold_tracker
+        pos = torch.tensor(np.asarray(data.xpos[self.base_body_id, :2]).copy(), dtype=torch.float32)[None]
+        yaw = torch.tensor([_camera_yaw(data, self.base_body_id)], dtype=torch.float32)
+        if self._hold_started:
+            tracker.update(pos, yaw, torch.from_numpy(self._hold_previous_command.copy())[None])
+        else:
+            tracker.prime(pos, yaw)
+            self._hold_started = True
+        # The just-finished interval used the previous command. Apply the new
+        # keyboard command after that update, matching Isaac reward->command->obs.
+        tracker.synchronize_command(torch.tensor(command[:3], dtype=torch.float32)[None])
+        self._hold_previous_command[:] = command[:3]
+        return tracker.observation()[0].numpy().copy()
+
     def act(
         self, data: mujoco.MjData, command: np.ndarray, gait_command: np.ndarray
     ) -> np.ndarray:
@@ -611,9 +758,12 @@ class WheelPolicy:
                 gait_command,
             )
         ).astype(np.float32, copy=False)
-        if policy_observation.size != POLICY_OBS_DIM:
+        if getattr(self, 'hold_tracker', None) is not None:
+            policy_observation = np.concatenate((policy_observation, self._hold_observation(data, command)))
+        expected_dim = getattr(self, 'policy_obs_dim', POLICY_OBS_DIM)
+        if policy_observation.size != expected_dim:
             raise RuntimeError(
-                f"策略观测维度为 {policy_observation.size}，预期 {POLICY_OBS_DIM}。"
+                f"策略观测维度为 {policy_observation.size}，预期 {expected_dim}。"
             )
 
         network_command = command.copy()
@@ -634,29 +784,137 @@ class WheelPolicy:
             raise RuntimeError("策略输出包含 NaN 或无穷值。")
         self.last_action[:] = result
         self.policy_step += 1
+        if self.continuous_gait_phase:
+            # This action will execute for one interval at the supplied
+            # frequency. A new frequency on the next call cannot rewrite it.
+            self._phase_cycles = (self._phase_cycles + POLICY_DT * float(gait_command[0])) % 1.0
         return result
 
 
+class FootholdDebug:
+    """Optional view of the same frozen-region/event algorithm used in training."""
+    def __init__(self, model, base_body_id, scanner, checkpoint):
+        source = REPO_ROOT / "exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/mdp/reward_math.py"
+        spec = importlib.util.spec_from_file_location("foothold_reward_math", source)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.model, self.base_body_id, self.scanner = model, base_body_id, scanner
+        self.body_ids = [_model_id(model, mujoco.mjtObj.mjOBJ_BODY, f"wheel_{side}_Link") for side in ("L", "R")]
+        options = {}
+        path = checkpoint.parent / "params/env.yaml"
+        if path.is_file():
+            cfg = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            term = cfg.get("rewards", {}).get("pen_foothold_region")
+            if isinstance(term, dict):
+                saved = term.get("params", {}).get("tracker_options", {})
+                options = {k: tuple(map(float,v)) if k == "axes" else float(v) for k,v in saved.items()}
+        self.tracker = module.FootholdRegionTracker(1, "cpu", **options)
+        self.radius = self.tracker.plan_options.get("wheel_radius", .128)
+        self.velocity = np.zeros(6)
+        self.last_rho = np.zeros(2)
+        print("[foothold] cyan=L, orange=R ellipse; green/red=last landing inside/outside. "
+              + ("Using checkpoint region parameters." if options else "No saved region config; previewing current defaults."))
+
+    def reset(self):
+        self.tracker.reset()
+        self.last_rho.fill(0.)
+
+    def update(self, data, command, gait, phase):
+        self.scanner.scan(data)
+        force_vectors = np.zeros((2,3))
+        force = np.zeros(6)
+        for index in range(data.ncon):
+            contact = data.contact[index]
+            geoms = (contact.geom1, contact.geom2)
+            for side, body_id in enumerate(self.body_ids):
+                for which in (0,1):
+                    if (self.model.geom_bodyid[geoms[which]] == body_id and
+                            self.model.geom_group[geoms[1-which]] == 0):
+                        mujoco.mj_contactForce(self.model, data, index, force)
+                        force_vectors[side] += (1. if which == 1 else -1.) * contact.frame.reshape(3,3).T @ force[:3]
+        positions = np.asarray(data.xpos[self.body_ids]).copy()
+        # Fit the same 3x3 wheel-local patches used by the training foot geometry.
+        clearance = np.full(2, np.nan)
+        for side, position in enumerate(positions):
+            hits=[]
+            for dx in (-.04,0.,.04):
+                for dy in (-.04,0.,.04):
+                    origin=np.array([position[0]+dx,position[1]+dy,position[2]+.3])
+                    distance=mujoco.mj_ray(self.model,data,origin,self.scanner.ray_direction,
+                        self.scanner.geom_group,True,-1,self.scanner.geom_id)
+                    hits.append(origin+distance*self.scanner.ray_direction if distance >= 0 else [np.nan]*3)
+            centroid, normal, valid = _fit_height_plane_numpy(np.asarray(hits))
+            if valid:
+                clearance[side] = (position-centroid)@normal-self.radius
+        _base_velocity_in_body_frame(self.model,data,self.base_body_id,self.velocity)
+        tensor = lambda value: torch.as_tensor(np.asarray(value).copy(), dtype=torch.float32).unsqueeze(0)
+        self.tracker.update(tensor(data.xpos[self.base_body_id]), tensor(_camera_yaw(data,self.base_body_id)),
+            tensor(self.velocity[3:]), tensor(command[:3]), tensor(gait), tensor(phase),
+            tensor(self.scanner.last_terrain_points), tensor(positions),
+            tensor(np.linalg.norm(force_vectors,axis=1)), tensor(clearance), POLICY_DT)
+        for side in range(2):
+            if self.tracker.events[0,side]:
+                self.last_rho[side] = float(self.tracker.rho[0,side])
+                print(f"[foothold] t={data.time:.2f} side={'LR'[side]} rho={self.last_rho[side]:.3f} "
+                      f"inside={self.last_rho[side] <= 1.}")
+
+    def add_geoms(self, scene):
+        tracker = self.tracker
+        def sphere(position, color, size=.008):
+            if scene.ngeom >= scene.maxgeom: return
+            geom=scene.geoms[scene.ngeom]
+            mujoco.mjv_initGeom(geom,mujoco.mjtGeom.mjGEOM_SPHERE,
+                np.array([size]*3),position,np.eye(3).ravel(),np.array(color,dtype=np.float32))
+            scene.ngeom += 1
+        for side,color in enumerate(((.1,.8,1.,1.),(1.,.55,.1,1.))):
+            if tracker.valid[0,side] and tracker.initialized[0,side]:
+                center=tracker.center[0,side].numpy()
+                normal=tracker.normal[0,side].numpy()
+                x=tracker.tangent_x[0,side].numpy(); y=tracker.tangent_y[0,side].numpy()
+                theta=np.linspace(0.,2*np.pi,33)
+                points=center+.004*normal+tracker.axes[0]*np.cos(theta)[:,None]*x+tracker.axes[1]*np.sin(theta)[:,None]*y
+                sphere(center+.004*normal,color)
+                for start,end in zip(points[:-1],points[1:]):
+                    if scene.ngeom >= scene.maxgeom: break
+                    geom=scene.geoms[scene.ngeom]
+                    mujoco.mjv_initGeom(geom,mujoco.mjtGeom.mjGEOM_CAPSULE,np.zeros(3),np.zeros(3),np.eye(3).ravel(),np.array(color,dtype=np.float32))
+                    mujoco.mjv_connector(geom,mujoco.mjtGeom.mjGEOM_CAPSULE,.002,start,end)
+                    scene.ngeom += 1
+            if tracker.last_landing_valid[0,side]:
+                position=tracker.last_landing[0,side].numpy()-self.radius*tracker.last_landing_normal[0,side].numpy()
+                sphere(position, (0.,1.,.2,1.) if self.last_rho[side] <= 1. else (1.,0.,0.,1.), .012)
+
+
 class TorqueController:
-    """Convert Isaac Lab actions to MuJoCo torques, with optional low-pass filtering."""
+    """Convert Isaac Lab actions to MuJoCo torques using wheel PI control."""
 
     def __init__(
         self,
         model: mujoco.MjModel,
         control_mode: str,
         *,
+        wheel_kp: float = 2.0,
+        wheel_ki: float = 0.5,
         low_pass_enabled: bool = False,
         cutoff_hz: float = 20.0,
         control_dt: float = PHYSICS_DT,
     ) -> None:
         if control_mode not in CONTROL_MODES:
             raise ValueError(f"不支持的控制模式：{control_mode}")
+        if not math.isfinite(wheel_kp) or wheel_kp <= 0.0:
+            raise ValueError("轮速比例增益 Kp 必须是大于 0 的有限数。")
+        if not math.isfinite(wheel_ki) or wheel_ki < 0.0:
+            raise ValueError("轮速积分增益 Ki 必须是大于等于 0 的有限数。")
         if cutoff_hz <= 0.0:
             raise ValueError("力矩低通滤波截止频率必须大于 0 Hz。")
         if control_dt <= 0.0:
             raise ValueError("力矩控制周期必须大于 0 s。")
         self.model = model
         self.control_mode = control_mode
+        self.wheel_kp = wheel_kp
+        self.wheel_ki = wheel_ki
+        self.control_dt = control_dt
+        self.wheel_integral_error = np.zeros(2, dtype=np.float64)
         self.low_pass_enabled = low_pass_enabled
         self.cutoff_hz = cutoff_hz
         self.low_pass_alpha = 1.0 - math.exp(
@@ -704,24 +962,41 @@ class TorqueController:
         ).copy()
 
     def reset(self) -> None:
-        """Reset the filter so torque starts from zero after a robot reset."""
+        """Reset controller memory after a robot reset."""
+        self.wheel_integral_error.fill(0.0)
         self.filtered_torque.fill(0.0)
 
     def apply(self, data: mujoco.MjData, action: np.ndarray) -> float:
         leg_targets = self.default_leg_positions + 0.25 * action[:6]
         leg_torque = 40.0 * (leg_targets - data.qpos[self.leg_qpos_addresses])
         leg_torque -= 2.5 * data.qvel[self.leg_dof_addresses]
-        # In Isaac Lab the Foot expert still emits eight raw actions (and sees
-        # them through last_action), but JointVelocityActionCfg uses scale=0
-        # for both wheels.  Mirror that processed-action behavior here rather
-        # than feeding the unconstrained raw wheel outputs to MuJoCo.
-        wheel_targets = (
-            np.zeros(2, dtype=np.float64)
-            if self.control_mode == "foot"
-            else np.asarray(action[6:], dtype=np.float64)
+        # Foot always brakes toward zero wheel velocity, matching Isaac Lab.
+        # Wheel mode continues to use the policy targets.
+        wheel_targets = np.asarray(action[6:], dtype=np.float64)
+        if self.control_mode == "foot":
+            wheel_targets = np.zeros_like(wheel_targets)
+        wheel_error = wheel_targets - data.qvel[self.wheel_dof_addresses]
+        candidate_integral = (
+            self.wheel_integral_error + wheel_error * self.control_dt
+            if self.wheel_ki > 0.0
+            else np.zeros_like(self.wheel_integral_error)
         )
-        wheel_torque = 0.8 * (
-            wheel_targets - data.qvel[self.wheel_dof_addresses]
+        proportional_torque = self.wheel_kp * wheel_error
+        candidate_torque = proportional_torque + self.wheel_ki * candidate_integral
+        pushes_upper_limit = (candidate_torque > 80.0) & (wheel_error > 0.0)
+        pushes_lower_limit = (candidate_torque < -80.0) & (wheel_error < 0.0)
+        accept_integral = ~(pushes_upper_limit | pushes_lower_limit)
+        self.wheel_integral_error = np.where(
+            accept_integral,
+            candidate_integral,
+            self.wheel_integral_error,
+        )
+        if self.wheel_ki == 0.0:
+            self.wheel_integral_error.fill(0.0)
+        wheel_torque = np.clip(
+            proportional_torque + self.wheel_ki * self.wheel_integral_error,
+            -80.0,
+            80.0,
         )
         raw_torque = np.clip(
             np.concatenate((leg_torque, wheel_torque)), -80.0, 80.0
@@ -1035,18 +1310,17 @@ class TelemetryPlot:
         if self.times and simulation_time < self.times[-1]:
             self.reset()
 
-        mujoco.mj_objectVelocity(
+        _base_velocity_in_body_frame(
             self.model,
             data,
-            mujoco.mjtObj.mjOBJ_BODY,
             self.base_body_id,
             self.velocity_buffer,
-            1,
         )
         rotation = np.asarray(
             data.xmat[self.base_body_id], dtype=np.float64
         ).reshape(3, 3)
         roll, pitch = _roll_pitch_degrees(rotation)
+        self.scanner.scan(data)
         roll_ref, pitch_ref = self.scanner.attitude_reference(data)
         sample = {
             "vx": float(self.velocity_buffer[3]),
@@ -1204,8 +1478,10 @@ def _render(
     command: np.ndarray,
     region: TerrainRegion,
     torque_norm: float,
+    foothold_debug: FootholdDebug | None = None,
 ) -> None:
     # MuJoCo azimuth 45 deg places the camera at local (-x, -y): right rear.
+    _refresh_body_kinematics(model, data)
     yaw = _camera_yaw(data, base_body_id)
     camera.lookat[:] = data.xpos[base_body_id]
     camera.lookat[2] += 0.10
@@ -1221,6 +1497,8 @@ def _render(
         mujoco.mjtCatBit.mjCAT_ALL.value,
         scene,
     )
+    if foothold_debug is not None:
+        foothold_debug.add_geoms(scene)
     mujoco.mjr_render(viewport, scene, context)
     left_text = (
         "W/S forward/back   Q/E left/right\n"
@@ -1270,10 +1548,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--yaw-speed", type=float, default=0.6)
     parser.add_argument("--body-height", type=float, default=0.80)
     parser.add_argument("--height-rate", type=float, default=0.08)
-    parser.add_argument("--gait-frequency", type=float, default=1.7)
-    parser.add_argument("--gait-offset", type=float, default=0.5)
-    parser.add_argument("--gait-duration", type=float, default=0.525)
-    parser.add_argument("--swing-height", type=float, default=0.14)
+    parser.add_argument(
+        "--gait-frequency", type=float, default=None,
+        help="Foot: training-range midpoint; Wheel: 1.7. Explicit values override the default.",
+    )
+    parser.add_argument(
+        "--gait-offset", type=float, default=None,
+        help="Foot: training-range midpoint; Wheel: 0.5. Explicit values override the default.",
+    )
+    parser.add_argument(
+        "--gait-duration", type=float, default=None,
+        help="Foot: training-range midpoint (fallback 0.5); Wheel: 0.525.",
+    )
+    parser.add_argument(
+        "--swing-height", type=float, default=None,
+        help="Foot: training-range midpoint (fallback 0 m); Wheel: 0.14 m.",
+    )
     parser.add_argument("--spawn-z-offset", type=float, default=0.1)
     parser.add_argument("--render-hz", type=float, default=60.0)
     parser.add_argument("--plot-hz", type=float, default=5.0)
@@ -1281,6 +1571,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--plot-history", type=float, default=20.0)
     parser.add_argument("--camera-distance", type=float, default=3.5)
     parser.add_argument("--camera-elevation", type=float, default=-18.0)
+    parser.add_argument(
+        "--wheel-kp",
+        "--wheel-kv",
+        dest="wheel_kp",
+        type=float,
+        default=2.0,
+        help=(
+            "Wheel velocity-error proportional gain in N·m/(rad/s) "
+            "(default: 2.0; --wheel-kv is a compatibility alias)."
+        ),
+    )
+    parser.add_argument(
+        "--wheel-ki",
+        type=float,
+        default=0.5,
+        help="Wheel velocity-error integral gain in N·m/rad (default: 0.5).",
+    )
     parser.add_argument(
         "--torque-low-pass",
         action="store_true",
@@ -1292,6 +1599,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=20.0,
         help="Torque low-pass cutoff frequency in Hz (default: 20; filter is off unless enabled).",
     )
+    parser.add_argument("--show-footholds", action="store_true", help="Foot: preview frozen landing regions and actual landing events.")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument(
         "--no-plot", action="store_true", help="Disable the live telemetry window."
@@ -1309,6 +1617,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         parser.error("--plot-sample-hz 必须大于 0。")
     if args.plot_history <= 0.0:
         parser.error("--plot-history 必须大于 0。")
+    if not math.isfinite(args.wheel_kp) or args.wheel_kp <= 0.0:
+        parser.error("--wheel-kp 必须是大于 0 的有限数。")
+    if not math.isfinite(args.wheel_ki) or args.wheel_ki < 0.0:
+        parser.error("--wheel-ki 必须是大于等于 0 的有限数。")
     if args.torque_cutoff_hz <= 0.0:
         parser.error("--torque-cutoff-hz 必须大于 0。")
     if args.max_steps is not None and args.max_steps <= 0:
@@ -1357,6 +1669,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint = discover_latest_checkpoint(checkpoint_root.expanduser().resolve())
     if not checkpoint.is_file():
         raise FileNotFoundError(f"checkpoint 不存在：{checkpoint}")
+    gait_command = resolve_gait_command(args, checkpoint)
     body_height_range = checkpoint_body_height_range(checkpoint)
     if not body_height_range[0] <= args.body_height <= body_height_range[1]:
         raise ValueError(
@@ -1377,34 +1690,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     torque_controller = TorqueController(
         model,
         args.mode,
+        wheel_kp=args.wheel_kp,
+        wheel_ki=args.wheel_ki,
         low_pass_enabled=args.torque_low_pass,
         cutoff_hz=args.torque_cutoff_hz,
     )
     rng = np.random.default_rng(args.seed)
-    gait_command = np.asarray(
-        (
-            args.gait_frequency,
-            args.gait_offset,
-            args.gait_duration,
-            args.swing_height,
-        ),
-        dtype=np.float32,
-    )
     command_state = KeyboardCommandState(args.body_height, body_height_range)
     spawn_xy, spawn_yaw = reset_robot(
         model, data, region, rng, args.spawn_z_offset
     )
     policy.reset(data, gait_command)
     torque_controller.reset()
+    foothold_debug = FootholdDebug(model, base_body_id, scanner, checkpoint) if args.show_footholds and args.mode == "foot" else None
     _print_help(checkpoint, args.mode, region, spawn_xy, spawn_yaw)
     print(
         f"[runtime] mode={args.mode}, checkpoint_iter={policy.iteration}, "
-        f"wheel_target={'locked_zero' if args.mode == 'foot' else 'policy'}, "
+        f"wheel_target={'fixed_zero' if args.mode == 'foot' else 'policy'}, "
         f"device={device}, "
         f"physics_dt={PHYSICS_DT}, policy_dt={POLICY_DT}, "
+        f"wheel_kp={args.wheel_kp:g}, wheel_ki={args.wheel_ki:g}, "
         f"torque_low_pass={'on' if args.torque_low_pass else 'off'}, "
         f"torque_cutoff_hz={args.torque_cutoff_hz:g}, "
-        f"height_range={body_height_range}"
+        f"height_range={body_height_range}, "
+        f"gait_clock={'continuous' if policy.continuous_gait_phase else 'legacy'}, "
+        f"gait=({', '.join(f'{value:g}' for value in gait_command)})"
     )
 
     window = None
@@ -1499,6 +1809,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
                 policy.reset(data, gait_command)
                 torque_controller.reset()
+                if foothold_debug is not None:
+                    foothold_debug.reset()
                 action.fill(0.0)
                 episode_physics_steps = 0
                 reset_requested = False
@@ -1523,6 +1835,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.yaw_speed,
                     args.height_rate,
                 )
+                if foothold_debug is not None:
+                    phase = policy._phase_cycles if policy.continuous_gait_phase else (policy.policy_step * POLICY_DT * float(gait_command[0])) % 1.
+                    foothold_debug.update(data, command, gait_command, phase)
                 action = policy.act(data, command, gait_command)
             torque_norm = torque_controller.apply(data, action)
             mujoco.mj_step(model, data)
@@ -1570,6 +1885,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     command,
                     region,
                     torque_norm,
+                    foothold_debug,
                 )
                 command_state.sync_from_window(window)
                 while next_render_time <= data.time + 1.0e-12:

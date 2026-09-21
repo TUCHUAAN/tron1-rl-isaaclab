@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from isaaclab_tasks.utils.wrappers.rsl_rl import RslRlOnPolicyRunnerCfg
+
+
+def _parse_bool(value: str) -> bool:
+    """Parse explicit CLI booleans without treating the string 'False' as true."""
+    normalized = value.strip().lower()
+    if normalized in {"true", "yes", "1"}:
+        return True
+    if normalized in {"false", "no", "0"}:
+        return False
+    raise argparse.ArgumentTypeError("Expected true/false, yes/no, or 1/0.")
+
+
+def _positive_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number <= 0.0:
+        raise argparse.ArgumentTypeError("Expected a finite positive number.")
+    return number
 
 
 def add_rsl_rl_args(parser: argparse.ArgumentParser):
@@ -20,8 +38,21 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
         "--experiment_name", type=str, default=None, help="Name of the experiment folder where logs will be stored."
     )
     arg_group.add_argument("--run_name", type=str, default=None, help="Run name suffix to the log directory.")
+    arg_group.add_argument(
+        "--log_root", type=str, default=None,
+        help="Parent directory for timestamped runs; default: logs/rsl_rl/<experiment_name>.",
+    )
+    arg_group.add_argument("--learning_rate", type=_positive_float, default=None, help="PPO learning rate.")
+    arg_group.add_argument(
+        "--encoder_learning_rate", type=_positive_float, default=None,
+        help="Learning rate for the independent history-encoder optimizer.",
+    )
+    arg_group.add_argument(
+        "--learning_rate_schedule", choices=("fixed", "adaptive"), default=None,
+        help="PPO learning-rate schedule; fixed also disables linear annealing.",
+    )
     # -- load arguments
-    arg_group.add_argument("--resume", type=bool, default=None, help="Whether to resume from a checkpoint.")
+    arg_group.add_argument("--resume", type=_parse_bool, default=None, help="Whether to resume from a checkpoint.")
     arg_group.add_argument("--load_run", type=str, default=None, help="Name of the run folder to resume from.")
     arg_group.add_argument("--checkpoint", type=str, default=None, help="Checkpoint file to resume from.")
     # -- logger arguments
@@ -74,6 +105,16 @@ def update_rsl_rl_cfg(agent_cfg: RslRlOnPolicyRunnerCfg, args_cli: argparse.Name
         agent_cfg.load_checkpoint = args_cli.checkpoint
     if args_cli.run_name is not None:
         agent_cfg.run_name = args_cli.run_name
+    if args_cli.experiment_name is not None:
+        agent_cfg.experiment_name = args_cli.experiment_name
+    if args_cli.learning_rate is not None:
+        agent_cfg.algorithm.learning_rate = args_cli.learning_rate
+    if args_cli.encoder_learning_rate is not None:
+        agent_cfg.algorithm.est_learning_rate = args_cli.encoder_learning_rate
+    if args_cli.learning_rate_schedule is not None:
+        agent_cfg.algorithm.schedule = args_cli.learning_rate_schedule
+        if args_cli.learning_rate_schedule == "fixed":
+            agent_cfg.algorithm.anneal_lr = False
     if args_cli.logger is not None:
         agent_cfg.logger = args_cli.logger
     # set the project name for wandb and neptune

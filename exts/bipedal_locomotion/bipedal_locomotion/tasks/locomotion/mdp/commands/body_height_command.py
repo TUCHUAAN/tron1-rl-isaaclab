@@ -121,7 +121,9 @@ class BodyHeightCommand(CommandTerm):
         self._sample_count += 1.0
 
     def _resample_command(self, env_ids: Sequence[int]):
-        self._target[env_ids, 0].uniform_(*self.cfg.ranges.height)
+        # Advanced indexing returns a copy: sample separately and assign back.
+        sampled = torch.empty(len(env_ids), device=self.device, dtype=self._target.dtype)
+        self._target[env_ids, 0] = sampled.uniform_(*self.cfg.ranges.height)
         if self.cfg.endpoint_fraction > 0.0:
             selector = torch.rand(len(env_ids), device=self.device)
             half_fraction = 0.5 * self.cfg.endpoint_fraction

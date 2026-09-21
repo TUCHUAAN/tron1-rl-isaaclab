@@ -1,10 +1,14 @@
 # 当前双专家方案与原有 WF 及 PF 网络输入对比
 
-> 对比时间：2026-09-04。
+> 对比时间：2026-09-18。
 >
 > 原有方案指 `Isaac-Limx-WF-Blind-Flat-v0` 和 `Isaac-Limx-PF-Blind-Flat-v0`；当前方案指 `Isaac-Limx-WF-Wheel-Mode-v0` 和 `Isaac-Limx-WF-Foot-AllTerrain-v0`。
 >
 > 本文以当前工作树中的最终生效配置为准，重点说明 Actor、历史编码器、Commands 和 Critic 的输入维度、数据来源及拼接方式。原有 PF 的维度同时使用已训练的 `model_2000.pt` 权重形状复核。
+
+当前为 **v12**：Foot/Wheel 的 policy 和 critic 均追加六维零命令保持误差/启用标记，与奖励共用同一 tracker；MuJoCo 同步支持。policy 161D、Actor 168D，history/Encoder 仍 340D。Foot 保留 v11 的 2 cm 中段最低净空成本 −1.0、漏迈 −0.2/次及此前跟踪权重。**从头训练，不微调**；详见 [v12 观测与训练说明](wf_hold_observation_v12.md)。
+
+本版已改变网络输入：policy 155→161、Actor 162→168、critic 原尺寸+6；Encoder 340→3 保持。新增量为零命令保持误差及启用标记，旧 Actor 不能直接加载到新环境。按用户要求从头训练；MuJoCo 同时支持旧 155D 与新 161D policy，新版必须保留配置快照。
 
 ## 1. 总体输入链路
 
@@ -33,19 +37,19 @@ critic_input = concat(critic_obs, commands)
 
 | 项目 | 原有 WF | 原有 PF | 当前 Wheel | 当前 Foot |
 |---|---:|---:|---:|---:|
-| 当前 `policy_obs` | `28` | `30` | `155` | `155` |
+| 当前 `policy_obs` | `28` | `30` | `161` | `161` |
 | `obsHistory` 单帧 | `28` | `30` | `34` | `34` |
 | 历史帧数 | `10` | `10` | `10` | `10` |
 | Encoder 输入 | `280` | `300` | `340` | `340` |
 | Encoder 输出 latent | `3` | `3` | `3` | `3` |
 | `commands` | `3` | `3` | `4` | `4` |
-| Actor 总输入 | `34` | `36` | `162` | `162` |
+| Actor 总输入 | `34` | `36` | `168` | `168` |
 | Actor 输出 | `8` | `6` | `8` | `8` |
 | Actor / Critic 隐藏层 | `[512, 256, 128]` | 相同 | 相同 | 相同 |
 | Encoder 隐藏层 | `[256, 128]` | 相同 | 相同 | 相同 |
 | 全局 running normalization | 关闭 | 关闭 | 关闭 | 关闭 |
 
-当前 Wheel 和 Foot 故意使用完全相同的 `155 + 340 + 4` schema，这是 Dual Play 能同时加载并切换两个 checkpoint 的前提。
+当前 Wheel 和 Foot 故意使用完全相同的 `161 + 340 + 4` schema，这是 Dual Play 能同时加载并切换两个 checkpoint 的前提。
 
 ## 3. Actor 当前帧输入对比
 
@@ -75,7 +79,7 @@ critic_input = concat(critic_obs, commands)
 
 PF URDF 中左右足端关节是 fixed joint，不会出现在 Isaac Lab articulation 的关节状态里。因此 PF 的 `joint_pos`、`joint_vel`、`last_action` 和 Actor 输出均为 6 维。这个结论也与 `model_2000.pt` 中 Encoder `300 → 3`、Actor `36 → 6` 的权重形状一致。
 
-### 3.3 当前 Wheel / Foot：155 维
+### 3.3 当前 Wheel / Foot：161 维
 
 | `policy_obs` 切片 | 维度 | 内容 |
 |---|---:|---|
@@ -87,11 +91,13 @@ PF URDF 中左右足端关节是 fixed joint，不会出现在 Isaac Lab articul
 | `[28:149]` | 121 | base 下方局部地形高度扫描 |
 | `[149:151]` | 2 | gait phase：`sin(phase), cos(phase)` |
 | `[151:155]` | 4 | gait command |
+| `[155:158]` | 3 | 归一化零命令保持误差 x/y/yaw |
+| `[158:161]` | 3 | 对应保持分量启用标记 |
 
-与原有 WF 相比，新增的 `127` 维为：
+与原有 WF 相比，新增的 `133` 维为：
 
 ```text
-121 维高度扫描 + 2 维 gait phase + 4 维 gait command
+121 维高度扫描 + 2 维 gait phase + 4 维 gait command + 6 维零命令保持状态
 ```
 
 Wheel 并不使用 gait reward，但仍保留 gait 输入，目的是与 Foot checkpoint 保持完全相同的网络形状。
@@ -109,8 +115,8 @@ Wheel 并不使用 gait reward，但仍保留 gait 输入，目的是与 Foot ch
 |  | `[3:33]` | 30D `policy_obs` |
 |  | `[33:36]` | 3D 速度命令 |
 | Wheel / Foot | `[0:3]` | 3D history latent |
-|  | `[3:158]` | 155D `policy_obs` |
-|  | `[158:162]` | 3D 速度 + 1D 机身高度命令 |
+|  | `[3:164]` | 161D `policy_obs` |
+|  | `[164:168]` | 3D 速度 + 1D 机身高度命令 |
 
 `gait_command` 被放在 `policy_obs` 和 `obsHistory` 中；它不在独立 `commands` 组中。当前 `commands` 组的第 4 维只是机身高度命令。
 
@@ -166,22 +172,22 @@ source = env.action_manager.action
 
 对 Foot 尤其需要注意：
 
-- Foot 将轮速动作的 `scale=0`，所以实际轮速目标始终为零；
-- `last_action` 返回的仍是 8 维原始 action；
-- 因此其最后两维在训练中仍可能非零，即使它们不会改变实际轮速目标。
+- Foot 的最后两维保留原始动作历史，但 processed 轮速参考恒为 `0`，不影响 PI 目标；
+- `last_action` 仍返回裁剪前的 8 维原始 action；
+- 因此策略能从历史中看到自己的完整轮动作，但执行器只接收安全范围内的目标。
 
 ### 5.6 Gait phase
 
-Gait phase 不是传感器量，而是根据 episode 时间和当前步态频率计算：
+Gait phase 来自命令时钟。2026-09-15 起 Foot 启用连续相位：
 
 ```text
-phase_01 = remainder(episode_step × policy_dt × gait_frequency, 1.0)
+phase_01 = remainder(previous_phase + executed_frequency × policy_dt, 1.0)
 gait_phase = [sin(2π × phase_01), cos(2π × phase_01)]
 ```
 
 Sin/Cos 表达避免相位从 1 回到 0 时在网络输入上产生大跳变。
 
-当前实现用“当前 frequency × episode 累计时间”重算相位，而不是逐步积分相位。因此 frequency 重采样时，计算出的 gait phase 可能发生瞬时跳变。
+奖励与 policy/critic/history 观测共用同一个 Foot 相位，改频率只影响未来推进，reset 只清零对应环境。MuJoCo 根据训练快照 `commands.gait_command.continuous_phase` 选择时钟。Wheel/PF 保持原有 `remainder(episode_step × policy_dt × current_frequency, 1.0)`，其频率重采样仍可能改变相位；输入维度均保持不变。
 
 ### 5.7 Gait command
 
@@ -220,7 +226,7 @@ height_value = clip(height_value, 0.0, 10.0)
 
 它不是直接的世界系地面 Z 坐标，而是射线传感器相对击中点的高度差，再减去默认 `0.5 m` offset。
 
-当前的轮下局部射线 `wheel_L/R_ground_scan` 不进入 Actor 或 Critic，它们只用于 Wheel 接地奖励。
+当前的轮下局部射线 `wheel_L/R_ground_scan` 不进入 Actor 或 Critic。Wheel 用它们计算轮心接地几何置信度；Foot 还用它们计算逐轮局部平面、摆动轮缘净空、近地切向运动、接触前落地速度、滑移（Foot 加速度项现已关闭）。它们影响奖励和诊断，但不是网络输入。
 
 ### 5.9 速度和高度 Commands
 
@@ -229,7 +235,9 @@ velocity_commands = command_manager.get_command("base_velocity")
                    = [vx, vy, wz]
 ```
 
-Wheel 的这 3 维输入形状没有变化，但命令生成方式为互斥四类：`25%` 全零站立、`30%` 仅 `vx`、`10%` 仅 `wz`、`35%` 同时采样 `vx/wz`，且 `vy` 恒为零。四类采样标签只用于命令生成和 TensorBoard 诊断，不作为额外网络输入；Actor 只看到最终的 `[vx,0,wz]`。
+Wheel 的这 3 维输入形状没有变化，但命令生成方式为互斥四类：`25%` 全零站立、`30%` 仅 `vx`、`10%` 仅 `wz`、`35%` 同时采样 `vx/wz`，且 `vy` 恒为零。Actor 只看到最终的 `[vx,0,wz]`。
+
+Foot 使用五种互斥模式：`15%` 原地踏步、`25%` 纯前后、`10%` 纯侧移、`20%` 纯 yaw、`30%` 混合。有效分量分别从 `vx±0.8 m/s`、`vy±0.4 m/s`、`wz±0.8 rad/s` 采样，纯模式中的其他分量严格置零。Wheel/Foot 的模式编号只用于采样和 TensorBoard 条件统计，不拼进 observation；网络仍只看到最终的 3 维速度命令。
 
 当前 Wheel/Foot 还增加：
 
@@ -238,6 +246,8 @@ body_height_command = command_manager.get_command("body_height")
 ```
 
 当前工作树中 Wheel 和 Foot 共用 `0.65～0.85 m` 的高度目标范围，但它始终只占 Actor 输入的 1 维。
+
+2026-09-10 修复后，高度目标的 `80%` 非端点样本会真正从完整区间均匀采样；另外 `10%/10%` 精确取最小/最大值。旧实现的高级索引写入失效，使非端点分支保留上一次目标。该修改只改变以后训练看到的命令分布，不改变输入维数或旧 checkpoint 权重。
 
 ## 6. 观测后处理和噪声
 
@@ -290,7 +300,7 @@ Runner 现在从实际 `obsHistory.flatten(start_dim=1).shape[1]` 推导 Encoder
 history_dim = 10 × policy_obs_dim
 ```
 
-这对当前双专家必不可少，因为当前帧是 155 维，历史单帧却只有 34 维。
+这对当前双专家必不可少，因为当前帧是 161 维，历史单帧却只有 34 维。
 
 ### 7.3 Latent 的训练目标
 
@@ -358,17 +368,30 @@ PF 的 `robot_pos` 和 `robot_base_pose` 当前都直接返回 `root_pos_w`，�
 
 PF 的 `robot_feet_contact_force` 也有一个需注意的实现细节：虽然配置传入了足端 body names，当前 helper 直接展平 `contact_sensor.data.net_forces_w_history`，没有按 `sensor_cfg.body_ids` 切片。因此按现代码理解，PF Critic 获得的是该 contact sensor 的完整历史张量，而不一定只有左右足端接触力。
 
+### 8.2 `actual_height` 是否进入 Critic
+
+`actual_height` 没有作为单独 1 维量进入 Actor 或 Critic。Wheel/Foot 的高度奖励与高度跟踪指标会临时执行：
+
+```text
+对 121 个 base height_scanner 命中点拟合局部平面 (p_bar, n)
+actual_height = abs((p_base - p_bar) dot n)
+```
+
+网络侧得到的是 121 维原始高度扫描；Critic 另外具有 root 位置等特权状态和 1 维归一化高度命令，但没有直接收到拟合后的 `actual_height`、高度误差、平面法向或接地门控值。因此把 121 维扫描替换成 1 维离地高度会丢失前方/周围地形形状；若只给 Critic 增加标量高度，则会改变 Critic 输入尺寸和新 checkpoint 的价值网络结构，但不会改变 Actor 的部署输入。
+
 ## 9. 哪些传感器不是网络输入
 
 | 数据 | 用途 | 是否进入 Actor |
 |---|---|:---:|
-| `wheel_L/R_ground_contact` | Wheel 有效接地奖励 | -- |
-| `wheel_L/R_ground_scan` | Wheel 轮心至局部地面几何检查 | -- |
+| `wheel_L/R_ground_contact` | Wheel/Foot 地形过滤接触力、支撑门控、Foot 落地与净空判断 | -- |
+| `wheel_L/R_ground_scan` | Wheel/Foot 轮心至逐轮局部地面的几何检查与局部奖励 | -- |
 | 全身 `contact_forces` | 奖励、终止、Critic 特权信息 | -- |
 | base `height_scanner` | Actor/Critic 地形输入、高度/姿态奖励、FSM auto 判断 | ✓ |
 | FSM 读取的 base speed、wheel speed、双轮接地、直立度 | 切换安全判断 | 不作为 Actor 额外输入 |
 
-Wheel 的“双轮有效接地”不是一个直接喂给 Actor 的 bool。Actor 只能通过本体状态、高度扫描和奖励反馈间接学会维持接地。
+Wheel/Foot 的轮端有效接地置信度都不是直接喂给 Actor 的 bool。Actor 只能通过本体状态、高度扫描和奖励反馈间接学会维持或切换支撑。
+
+Wheel 和 Foot 的显式 PI 轮速控制都不增加网络输入维度。每次 reset 随机采样的 `Kp∈[0.5,4.0]` 和 `Ki/Kp∈[0,0.25] 1/s` 不直接输入 Actor 或 Critic；Actor 依靠最近 10 帧关节状态与 last action 间接适应执行器响应。Foot 的 processed 轮目标恒为 `0`，但 `last_action` 保留裁剪前原始值。Critic 中的 `robot_joint_stiffness/damping` 仍读取 asset 默认值，对两个专家的轮关节都不代表显式 PI 增益。
 
 ## 10. 部署时各输入如何对应到真机
 
@@ -384,14 +407,20 @@ Wheel 的“双轮有效接地”不是一个直接喂给 Actor 的 bool。Actor
 
 原有 WF/PF Blind-Flat Actor 不依赖外感知地形，部署接口更简单。当前 Wheel/Foot 的 Actor 直接依赖 121 维高度扫描，因此高程图生成、坐标系、offset 和更新频率必须与训练配置对齐。
 
+当前 MuJoCo 对齐实现不再直接使用 body inertial frame 的局部 `cvel` 作为网络速度。它先读取世界系质心线/角速度，再旋转到 `base_Link` 坐标系，以匹配 Isaac Lab 的 `root_lin_vel_b/root_ang_vel_b`；此前惯性主轴相对机身约有 `27°` 旋转，会把 roll/yaw 分量混合。策略、地形扫描、遥测和渲染读取状态前还会刷新运动学缓存，扫描未命中按训练侧裁剪语义编码为 `0`，但无效点不参与局部平面拟合。
+
+连续 Foot gait 的时钟约定保存在 checkpoint 同目录 `params/env.yaml`。缺少该文件时，Actor 维度虽然仍匹配，MuJoCo 却只能回退到默认 gait 和 legacy 相位判断，因此“权重可加载”不等于“输入时间语义一致”。正式模型归档应把 `model_*.pt` 与 `params/env.yaml` 视为不可拆分的一组。
+
 ## 11. 关键结论
 
 1. **原有 WF 是最简单的 blind 输入。** 28D 当前本体观测 + 280D 历史 + 3D 速度命令。
 2. **PF 在 blind 本体感知上加入 gait。** 它使用 30D 当前帧和 300D 历史；当前 Foot 因保留 8D WF 动作/状态 schema，使用 34D 历史单帧和 340D 历史。
 3. **当前双专家的主要增量是 121D 当前地形扫描。** 它不进入 history，所以 Encoder 仍为 340D 输入。
 4. **3D latent 有明确物理意义。** 它被单独训练为最近 10 帧观测对 base 线速度的估计。
-5. **Wheel 和 Foot 的网络输入完全一致。** 两者的差异主要在地形分布、奖励、命令范围和 Foot 轮动作 mask，不在网络 schema。
-6. **高度扫描是当前最大的 Sim-to-Real 输入风险。** 它现在没有显式高斯噪声，却占当前 `policy_obs` 的 121/155。
+5. **Wheel 和 Foot 的网络 schema 完全一致，但输入值的生成过程并不完全相同。** Foot 使用五类速度命令和连续累积 gait phase，Wheel 使用四类速度命令和 legacy 相位；Foot 的最后两维轮动作不影响 PI 目标，训练和部署均固定零参考。
+6. **高度扫描是当前最大的 Sim-to-Real 输入风险。** 它现在没有显式高斯噪声，却占当前 `policy_obs` 的 121/161。
+7. **两个专家的 PI 增益随机化都不改变 schema。** `Kp/Ki` 是执行器隐变量，策略只能从短时历史响应中间接估计。
+8. **部署必须同时对齐数值和时间语义。** 机身速度坐标系、扫描缺失值、状态刷新时机和连续 gait 标志任一不一致，都可能在网络维度完全正确的情况下导致策略失稳。
 
 ## 12. 主要代码位置
 
@@ -400,8 +429,10 @@ Wheel 的“双轮有效接地”不是一个直接喂给 Actor 的 bool。Actor
 | 原有 WF 观测组 | `exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/cfg/WF/limx_base_env_cfg.py` |
 | 原有 PF 观测组 | `exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/cfg/PF/limx_base_env_cfg.py` |
 | Wheel / Foot 共享 schema 和高度扫描 | `exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/robots/limx_wheelfoot_mode_env_cfg.py` |
+| Wheel/Foot PI 轮速 ActionTerm | `exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/mdp/actions.py` |
 | gait phase、gait command、非轮关节位置 | `exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/mdp/observations.py` |
 | Gait command 采样 | `exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/mdp/commands/gait_command.py` |
+| Foot 五类速度采样与条件诊断 | `exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/mdp/commands/foot_velocity_command.py` |
 | Body-height command 采样和限速 | `exts/bipedal_locomotion/bipedal_locomotion/tasks/locomotion/mdp/commands/body_height_command.py` |
 | 观测分组、尺寸推导和历史展平 | `rsl_rl/rsl_rl/runner/on_policy_runner.py` |
 | Actor/Critic 拼接与 Encoder 辅助 loss | `rsl_rl/rsl_rl/algorithm/ppo.py` |

@@ -132,6 +132,13 @@ def main():
                 if hasattr(velocity_term, "vel_command_b"):
                     velocity_term.vel_command_b[:] = 0.0
 
+            # The FSM can override commands after env.step produced obs. Refresh
+            # the shared hold flags/errors without advancing their clock twice.
+            if "zero_command_hold" in env.unwrapped.observation_manager.active_terms["policy"]:
+                hold = env.unwrapped.reward_manager.get_term_cfg("pen_zero_command_hold").func
+                obs = obs.clone()
+                obs[:, -6:] = hold.observe(env.unwrapped)
+
             wheel_actions = policy_action(wheel_policy, wheel_encoder, obs, obs_history, commands)
             foot_actions = policy_action(foot_policy, foot_encoder, obs, obs_history, commands)
             actions = fsm.route_actions(wheel_actions, foot_actions)

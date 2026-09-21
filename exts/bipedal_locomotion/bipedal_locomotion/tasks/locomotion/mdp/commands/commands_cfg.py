@@ -7,6 +7,7 @@ from isaaclab.utils import configclass
 
 from .body_height_command import BodyHeightCommand
 from .gait_command import GaitCommand  # Import the GaitCommand class
+from .foot_velocity_command import FootVelocityCommand
 from .wheel_support_velocity_command import WheelSupportVelocityCommand
 
 
@@ -34,6 +35,8 @@ class UniformGaitCommandCfg(CommandTermCfg):
 
     resampling_time_range: tuple[float, float] = MISSING
     """Time interval for resampling the gait (in seconds)."""
+    continuous_phase: bool = False
+    """Accumulate phase across frequency resamples instead of recomputing time * frequency."""
 
 
 @configclass
@@ -57,6 +60,29 @@ class UniformBodyHeightCommandCfg(CommandTermCfg):
     """Articulation whose base height is tracked for command metrics."""
     height_sensor_name: str = "height_scanner"
     """Ray caster used to measure height relative to the local terrain plane."""
+
+
+@configclass
+class FootVelocityCommandCfg(UniformVelocityCommandCfg):
+    """Exclusive Foot command modes and diagnostics grouped by commanded height."""
+
+    class_type: type = FootVelocityCommand
+    rel_standing_envs: float = 0.15
+    rel_heading_envs: float = 0.0
+    rel_straight_envs: float = 0.25
+    rel_lateral_envs: float = 0.10
+    rel_yaw_only_envs: float = 0.20
+    rel_mixed_envs: float = 0.30
+    wheel_body_names: tuple[str, str] = MISSING
+    leg_joint_names: tuple[str, ...] = MISSING
+    terrain_sensor_names: tuple[str, str] = MISSING
+    wheel_radius: float = 0.128
+    gait_command_name: str = "gait_command"
+    body_height_command_name: str = "body_height"
+    swing_reward_name: str = "rew_swing_clearance"
+    height_bin_edges: tuple[float, float] = (0.70, 0.80)
+    wheel_action_name: str = "joint_vel"
+    wheel_target_limit: float = 1.0
 
 
 @configclass

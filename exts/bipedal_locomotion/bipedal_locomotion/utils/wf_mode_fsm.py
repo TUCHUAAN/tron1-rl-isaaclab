@@ -96,26 +96,25 @@ class WheelfootModeFSM:
         return self.mode
 
     def route_actions(self, wheel_actions: torch.Tensor, foot_actions: torch.Tensor) -> torch.Tensor:
-        """Select/blend expert actions and hard-mask wheel targets when foot control is active."""
+        """Select or blend all actions, keeping Foot wheel targets within ±1 rad/s."""
         if wheel_actions.shape != foot_actions.shape:
             raise ValueError(f"Expert action shapes must match: {wheel_actions.shape} != {foot_actions.shape}")
         if wheel_actions.shape[-1] < 2:
             raise ValueError("Wheelfoot actions must contain two wheel commands at the end.")
 
+        bounded_foot_actions = foot_actions.clone()
+        bounded_foot_actions[..., -2:] = 0.0
+
         if self.mode == WheelfootMode.WHEEL:
             return wheel_actions
         if self.mode == WheelfootMode.FOOT:
-            actions = foot_actions.clone()
-            actions[..., -2:] = 0.0
-            return actions
+            return bounded_foot_actions
 
         alpha = min(self.transition_step / max(self.cfg.transition_steps, 1), 1.0)
         if self.mode == WheelfootMode.WHEEL_TO_FOOT:
-            actions = (1.0 - alpha) * wheel_actions + alpha * foot_actions
-            actions[..., -2:] = (1.0 - alpha) * wheel_actions[..., -2:]
+            actions = (1.0 - alpha) * wheel_actions + alpha * bounded_foot_actions
         else:
-            actions = (1.0 - alpha) * foot_actions + alpha * wheel_actions
-            actions[..., -2:] = alpha * wheel_actions[..., -2:]
+            actions = (1.0 - alpha) * bounded_foot_actions + alpha * wheel_actions
         return actions
 
 
