@@ -60,6 +60,7 @@ cd /home/tuchuaan/tron1-rl-isaaclab/tests
 - `A/D`：左转/右转
 - `Space`：清除当前运动指令
 - `R`：重置机器人；终端中可复用当前地形或重新选择
+- 双模态联调时：`1` 切换 Wheel，`2` 切换 Foot；Foot→Wheel 会等待当前步态周期结束
 - `Esc`：退出
 
 摄像头会根据机身航向持续更新，固定跟在机器人右后方。需要指定 checkpoint 或跳过交互选择时，例如：

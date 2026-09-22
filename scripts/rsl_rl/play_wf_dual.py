@@ -55,6 +55,16 @@ def policy_action(policy, encoder, obs, obs_history, commands):
     return policy(torch.cat((latent, obs, commands), dim=-1).detach())
 
 
+def foot_cycle_complete(env) -> bool:
+    """B2W-style defer point: only leave Foot at a gait-cycle boundary."""
+    try:
+        phase = env.unwrapped.command_manager.get_term("gait_command").phase
+        return bool((phase[0] < 0.05).item())
+    except (KeyError, AttributeError, RuntimeError):
+        # Tasks without a gait clock are safe to switch immediately.
+        return True
+
+
 def main():
     env_cfg = parse_env_cfg(
         task_name=args_cli.task,
@@ -116,21 +126,22 @@ def main():
             )
             both_contact = bool(torch.all(wheel_forces > 1.0).item())
             upright_cosine = float((-robot.data.projected_gravity_b[0, 2]).item())
+            previous_mode_before_update = fsm.mode
             fsm.update(
                 base_speed=base_speed,
                 wheel_speed=wheel_speed,
                 both_wheels_contact=both_contact,
                 upright_cosine=upright_cosine,
+                foot_cycle_complete=foot_cycle_complete(env),
             )
 
-            # A mode transition is a zero-velocity manoeuvre. Override both the
-            # policy command tensor and the live command term while blending.
-            if fsm.mode.value in ("wheel_to_foot", "foot_to_wheel"):
+            # B2W replaces the active mode instance; it does not blend two
+            # controllers. Hold the velocity command for the single frame in
+            # which the active expert changes, then continue with that expert.
+            mode_changed = fsm.mode != previous_mode_before_update
+            if mode_changed:
                 commands = commands.clone()
                 commands[:, :3] = 0.0
-                velocity_term = env.unwrapped.command_manager.get_term("base_velocity")
-                if hasattr(velocity_term, "vel_command_b"):
-                    velocity_term.vel_command_b[:] = 0.0
 
             # The FSM can override commands after env.step produced obs. Refresh
             # the shared hold flags/errors without advancing their clock twice.
@@ -139,9 +150,14 @@ def main():
                 obs = obs.clone()
                 obs[:, -6:] = hold.observe(env.unwrapped)
 
-            wheel_actions = policy_action(wheel_policy, wheel_encoder, obs, obs_history, commands)
-            foot_actions = policy_action(foot_policy, foot_encoder, obs, obs_history, commands)
-            actions = fsm.route_actions(wheel_actions, foot_actions)
+            # Only the active mode is evaluated. This is the policy-level
+            # equivalent of B2W's PlannerUpdateCurrentMode/OutputCurrentMode.
+            if fsm.mode.value == "wheel":
+                actions = policy_action(wheel_policy, wheel_encoder, obs, obs_history, commands)
+            else:
+                actions = policy_action(foot_policy, foot_encoder, obs, obs_history, commands)
+                actions = actions.clone()
+                actions[..., -2:] = 0.0
 
             if fsm.mode != previous_mode:
                 print(f"[INFO] WF mode: {previous_mode.value} -> {fsm.mode.value}")

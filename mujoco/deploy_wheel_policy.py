@@ -33,7 +33,7 @@ DEFAULT_FOOT_CHECKPOINT_ROOT = (
     REPO_ROOT / "logs" / "rsl_rl" / "wf_tron_1a_foot_all_terrain"
 )
 STABILITY_SELECTION_FILE = "selected_stability_checkpoint.txt"
-CONTROL_MODES = ("wheel", "foot")
+CONTROL_MODES = ("wheel", "foot", "dual")
 
 PHYSICS_DT = 0.005
 POLICY_DECIMATION = 4
@@ -279,29 +279,17 @@ def select_or_reuse_terrain_region_on_reset(
 
 
 def discover_latest_checkpoint(checkpoint_root: Path) -> Path:
-    selection_files = sorted(
-        checkpoint_root.glob(f"*/{STABILITY_SELECTION_FILE}"),
-        key=lambda path: (path.stat().st_mtime_ns, str(path)),
-        reverse=True,
-    )
-    for selection_file in selection_files:
-        try:
-            selected_text = selection_file.read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        if not selected_text:
-            continue
-        selected = Path(selected_text).expanduser()
-        if not selected.is_absolute():
-            selected = selection_file.parent / selected
-        if selected.is_file():
-            print(f"使用稳定性指标选出的 checkpoint：{selected}")
-            return selected
+    """Return the newest checkpoint file by filesystem modification time.
 
+    Dual-mode MuJoCo debugging intentionally uses the newest Wheel and Foot
+    snapshots, rather than a manually written stability-selection file.
+    """
     candidates = tuple(checkpoint_root.glob("**/model_*.pt"))
     if not candidates:
         raise FileNotFoundError(f"没有在 {checkpoint_root} 中找到 model_*.pt")
-    return max(candidates, key=lambda path: (path.stat().st_mtime_ns, str(path)))
+    selected = max(candidates, key=lambda path: (path.stat().st_mtime_ns, str(path)))
+    print(f"使用最新 checkpoint：{selected}")
+    return selected
 
 
 def resolve_device(requested: str) -> torch.device:
@@ -961,6 +949,13 @@ class TorqueController:
             model.qpos0[self.leg_qpos_addresses], dtype=np.float64
         ).copy()
 
+    def set_mode(self, control_mode: str) -> None:
+        """Switch the active wheel/foot actuator semantics without rebuilding MuJoCo."""
+        if control_mode not in ("wheel", "foot"):
+            raise ValueError(f"TorqueController mode must be wheel or foot, got {control_mode!r}")
+        self.control_mode = control_mode
+        self.wheel_integral_error.fill(0.0)
+
     def reset(self) -> None:
         """Reset controller memory after a robot reset."""
         self.wheel_integral_error.fill(0.0)
@@ -1028,6 +1023,7 @@ class KeyboardCommandState:
 
     def __init__(self, body_height: float, body_height_range: tuple[float, float]) -> None:
         self.pressed: set[int] = set()
+        self.requested_mode: str | None = None
         self.body_height = body_height
         self.body_height_min, self.body_height_max = body_height_range
 
@@ -1041,6 +1037,10 @@ class KeyboardCommandState:
                 self.pressed.add(key)
         elif key == glfw.KEY_SPACE and action == glfw.PRESS:
             self.clear_motion()
+        elif key == glfw.KEY_1 and action == glfw.PRESS:
+            self.requested_mode = "wheel"
+        elif key == glfw.KEY_2 and action == glfw.PRESS:
+            self.requested_mode = "foot"
 
     def clear_motion(self) -> None:
         self.pressed.clear()
@@ -1454,6 +1454,9 @@ def _print_help(
         print("  Q/E : 左移/右移（Wheel 训练时横向指令为 0，效果可能不稳定）")
     else:
         print("  Q/E : 左移/右移")
+    if control_mode == "dual":
+        print("  1 : Wheel 模式")
+        print("  2 : Foot 模式（Foot→Wheel 等待当前步态周期结束）")
     print("  Z/C : 升高/降低机身")
     print("  A/D : 左转/右转")
     print("  Space : 清除运动指令")
@@ -1529,6 +1532,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--mode", choices=CONTROL_MODES, default="wheel")
     parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--wheel-checkpoint", type=Path, default=None,
+                        help="Dual 模式使用的 Wheel checkpoint。")
+    parser.add_argument("--foot-checkpoint", type=Path, default=None,
+                        help="Dual 模式使用的 Foot checkpoint。")
     parser.add_argument(
         "--checkpoint-root",
         type=Path,
@@ -1654,28 +1661,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     regions = load_terrain_regions(args.terrain_manifest.expanduser().resolve())
     region = _select_region_from_args(args, regions)
-    if args.checkpoint is not None:
-        checkpoint = args.checkpoint.expanduser().resolve()
-    else:
-        checkpoint_root = (
-            args.checkpoint_root
-            if args.checkpoint_root is not None
-            else (
-                DEFAULT_FOOT_CHECKPOINT_ROOT
-                if args.mode == "foot"
-                else DEFAULT_WHEEL_CHECKPOINT_ROOT
+    def resolve_checkpoint(mode: str, explicit: Path | None) -> Path:
+        if explicit is not None:
+            result = explicit.expanduser().resolve()
+        elif args.checkpoint is not None and args.mode != "dual":
+            result = args.checkpoint.expanduser().resolve()
+        else:
+            root = args.checkpoint_root if args.checkpoint_root is not None else (
+                DEFAULT_FOOT_CHECKPOINT_ROOT if mode == "foot" else DEFAULT_WHEEL_CHECKPOINT_ROOT
             )
-        )
-        checkpoint = discover_latest_checkpoint(checkpoint_root.expanduser().resolve())
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"checkpoint 不存在：{checkpoint}")
-    gait_command = resolve_gait_command(args, checkpoint)
-    body_height_range = checkpoint_body_height_range(checkpoint)
-    if not body_height_range[0] <= args.body_height <= body_height_range[1]:
-        raise ValueError(
-            f"--body-height 必须在 checkpoint 的训练范围 "
-            f"[{body_height_range[0]}, {body_height_range[1]}] 内。"
-        )
+            result = discover_latest_checkpoint(root.expanduser().resolve())
+        if not result.is_file():
+            raise FileNotFoundError(f"{mode} checkpoint 不存在：{result}")
+        return result
+
+    if args.mode == "dual":
+        wheel_checkpoint = resolve_checkpoint("wheel", args.wheel_checkpoint)
+        foot_checkpoint = resolve_checkpoint("foot", args.foot_checkpoint)
+        checkpoints = {"wheel": wheel_checkpoint, "foot": foot_checkpoint}
+    else:
+        checkpoint = resolve_checkpoint(args.mode, None)
+        checkpoints = {args.mode: checkpoint}
+
+    def mode_args(mode: str) -> argparse.Namespace:
+        copied = argparse.Namespace(**vars(args))
+        copied.mode = mode
+        return copied
+
+    gait_commands = {
+        mode: resolve_gait_command(mode_args(mode), path)
+        for mode, path in checkpoints.items()
+    }
+    body_height_ranges = {mode: checkpoint_body_height_range(path) for mode, path in checkpoints.items()}
+    body_height_range = body_height_ranges["wheel" if args.mode == "dual" else args.mode]
+    for mode, height_range in body_height_ranges.items():
+        if not height_range[0] <= args.body_height <= height_range[1]:
+            raise ValueError(
+                f"--body-height 不在 {mode} checkpoint 的训练范围 "
+                f"[{height_range[0]}, {height_range[1]}] 内。"
+            )
     device = resolve_device(args.device)
 
     model = build_scene_model(
@@ -1686,10 +1710,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     data = mujoco.MjData(model)
     base_body_id = _model_id(model, mujoco.mjtObj.mjOBJ_BODY, "base_Link")
     scanner = TerrainHeightScanner(model, base_body_id)
-    policy = WheelPolicy(checkpoint, device, model, scanner, body_height_range)
+    policies = {
+        mode: WheelPolicy(path, device, model, scanner, body_height_ranges[mode])
+        for mode, path in checkpoints.items()
+    }
+    if args.mode == "dual":
+        print(f"[dual] Wheel checkpoint: {checkpoints['wheel']}")
+        print(f"[dual] Foot checkpoint:  {checkpoints['foot']}")
+    active_mode = "wheel" if args.mode == "dual" else args.mode
+    requested_mode = active_mode
+    policy = policies[active_mode]
+    gait_command = gait_commands[active_mode]
     torque_controller = TorqueController(
         model,
-        args.mode,
+        active_mode,
         wheel_kp=args.wheel_kp,
         wheel_ki=args.wheel_ki,
         low_pass_enabled=args.torque_low_pass,
@@ -1702,10 +1736,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     policy.reset(data, gait_command)
     torque_controller.reset()
-    foothold_debug = FootholdDebug(model, base_body_id, scanner, checkpoint) if args.show_footholds and args.mode == "foot" else None
-    _print_help(checkpoint, args.mode, region, spawn_xy, spawn_yaw)
+    foothold_debug = FootholdDebug(model, base_body_id, scanner, checkpoints[active_mode]) if args.show_footholds and active_mode == "foot" else None
+    _print_help(checkpoints[active_mode], args.mode, region, spawn_xy, spawn_yaw)
     print(
-        f"[runtime] mode={args.mode}, checkpoint_iter={policy.iteration}, "
+        f"[runtime] mode={args.mode}, active_mode={active_mode}, checkpoint_iter={policy.iteration}, "
         f"wheel_target={'fixed_zero' if args.mode == 'foot' else 'policy'}, "
         f"device={device}, "
         f"physics_dt={PHYSICS_DT}, policy_dt={POLICY_DT}, "
@@ -1724,6 +1758,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     context = None
     telemetry_plot = None
     reset_requested = False
+    mode_switch_pending = False
     if not args.headless:
         if not glfw.init():
             raise RuntimeError("GLFW 初始化失败；无显示环境可使用 --headless。")
@@ -1800,6 +1835,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.max_steps is not None and physics_steps >= args.max_steps:
                 break
 
+            if args.mode == "dual" and command_state.requested_mode is not None:
+                requested_mode = command_state.requested_mode
+                command_state.requested_mode = None
+                mode_switch_pending = True
+
+            if args.mode == "dual" and requested_mode != active_mode:
+                # Match B2W: do not blend two controllers. Foot->Wheel waits
+                # for the gait cycle boundary, then recreates the active mode.
+                phase = (policy._phase_cycles if policy.continuous_gait_phase
+                         else (policy.policy_step * POLICY_DT * float(gait_command[0])) % 1.0)
+                can_switch = active_mode == "wheel" or phase < 0.05
+                if can_switch:
+                    active_mode = requested_mode
+                    policy = policies[active_mode]
+                    gait_command = gait_commands[active_mode]
+                    policy.reset(data, gait_command)
+                    torque_controller.set_mode(active_mode)
+                    action.fill(0.0)
+                    mode_switch_pending = True
+                    print(f"[mode] active mode switched to {active_mode}; checkpoint={checkpoints[active_mode]}")
+
             if reset_requested:
                 command_state.clear_motion()
                 region = select_or_reuse_terrain_region_on_reset(region, regions)
@@ -1835,10 +1891,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.yaw_speed,
                     args.height_rate,
                 )
+                if mode_switch_pending:
+                    command[:3] = 0.0
                 if foothold_debug is not None:
                     phase = policy._phase_cycles if policy.continuous_gait_phase else (policy.policy_step * POLICY_DT * float(gait_command[0])) % 1.
                     foothold_debug.update(data, command, gait_command, phase)
                 action = policy.act(data, command, gait_command)
+                mode_switch_pending = False
             torque_norm = torque_controller.apply(data, action)
             mujoco.mj_step(model, data)
             physics_steps += 1
